@@ -1,0 +1,6 @@
+file_paths:
+  style_guide: "resources/semantic_conventions/style_guide/style_guide.txt"
+  style_guide_xls: "resources/semantic_conventions/style_guide/SEMIC_Style_Guide.xlsx"
+
+dir_paths:
+  models: "resources/semantic_model/models"

@@ -1,0 +1,34 @@
+The main purpose of this style guide is to provide guidance and decision-making support for the creators, maintainers and publishers of the Core Vocabularies and Application Profiles. In the context of European Interoperability Framework (EIF) [eif] this style guide primarily addresses the Semantic Interoperability layer. The main part of this document is organised as a series of self-contained rules and guidelines.
+
+Guidelines are organised into the following groups:
+- Methodology conventions
+- General conventions
+- Conceptual Model conventions
+- Semantic conventions
+- Data shape conventions
+- Publication conventions
+
+# General conventions
+## Reuse existing concepts as much as possible
+Reuse existing concepts as much as possible, respecting the original semantics and lexicalisation.
+
+## Prefer maintained vocabularies
+Quality of maintenance and governance should be reviewed before reuse. Reuse mostly vocabularies that are well maintained and governed.
+
+## Concept reference and terms
+Each concept shall be (a) referenceable by a URI, (b) formally defined and (c) described by a precise, unambiguous human-readable label and definition.
+
+## Vocabulary terminology style
+The terminology style shall be consistent across the vocabulary.
+
+## Vocabulary definition styling
+The concept definitions shall be elaborated consistently across the vocabulary.
+
+## Reuse compliance
+Compliance with a semantic data specification is satisfied by appropriate usage of terms that is in accordance with definitions and constraints.
+
+## Deontic modals
+Indicators of deontic modalities for classes and properties do not have semantic or normative value. Still they may be used as editorial annotations.
+
+# Other conventions
+Some of these conventions can be checked via the SEMIC style guide ITB validator. 

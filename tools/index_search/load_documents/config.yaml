@@ -1,0 +1,20 @@
+qdrant:
+  host: "localhost"
+  port: 6333
+  timeout: 120
+  check_compatibility: false
+
+collection:
+  name: "documents"
+  vector_size: 384
+  distance: "cosine"
+
+model:
+  name: "all-MiniLM-L6-v2"
+
+indexing:
+  batch_size: 5
+  documents_path: "documents"
+
+search:
+  limit: 3
