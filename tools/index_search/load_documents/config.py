@@ -1,10 +1,10 @@
 from pathlib import Path
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
-from dotenv import load_dotenv
 import yaml
 import os
 
+from dotenv import load_dotenv
 project_root = Path(__file__).parent.parent.parent.parent  # Remonte de 4 niveaux
 env_path = project_root / ".env"
 

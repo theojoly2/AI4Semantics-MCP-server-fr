@@ -1,13 +1,15 @@
-from dotenv import load_dotenv
-load_dotenv()
-
- 
 from fastmcp import FastMCP
 from fastmcp.tools import Tool
 from fastmcp.server.event_store import EventStore
 import resources
 import tools
+from pathlib import Path
 
+from dotenv import load_dotenv
+project_root = Path(__file__)  # Remonte de 4 niveaux
+env_path = project_root / ".env"
+
+load_dotenv(dotenv_path=env_path)
 
 
 # CHANGE FOR DEPLOYMENT/DEVELOPMENT!
