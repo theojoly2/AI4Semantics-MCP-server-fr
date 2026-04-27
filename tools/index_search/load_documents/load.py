@@ -13,24 +13,26 @@ client.create_collection(
     vectors_config=VectorParams(size=384, distance=Distance.COSINE)
 )
 
+
 # Index documents
 def index_documents():
     points = []
     docs_path = Path(__file__).parent / "documents"
     total_indexed = 0
-    
+
     if not docs_path.exists():
         print(f"✗ Directory not found: {docs_path}")
         return
-    
+
     for i, filepath in enumerate(docs_path.iterdir()):
         if filepath.is_file():
             try:
                 text = filepath.read_text()
                 embedding = model.encode(text)
-                points.append(PointStruct(id=total_indexed + i, vector=embedding.tolist(), payload={"text": text, "filename": filepath.name}))
+                points.append(PointStruct(id=total_indexed + i, vector=embedding.tolist(), payload={
+                    "text": text, "filename": filepath.name}))
                 print(f"✓ Loaded: {filepath.name}")
-                
+
                 # Upload in smaller batches
                 if len(points) >= BATCH_SIZE:
                     try:
@@ -40,10 +42,10 @@ def index_documents():
                         points = []
                     except Exception as e:
                         print(f"  ✗ Batch upload failed: {e}")
-                        points = [] 
+                        points = []
             except Exception as e:
                 print(f"✗ Failed: {filepath.name} - {e}")
-    
+
     if points:
         try:
             client.upsert(collection_name=COLLECTION, points=points)
@@ -51,7 +53,7 @@ def index_documents():
             total_indexed += len(points)
         except Exception as e:
             print(f"  ✗ Final batch upload failed: {e}")
-    
+
     print(f"\n✓ Indexing complete: {total_indexed} documents")
     client.upsert(collection_name=COLLECTION, points=points)
     print(f"\nIndexed {len(points)} documents")

@@ -1,8 +1,9 @@
 qdrant:
-  host: "localhost"
+  host: "qdrant"
   port: 6333
   timeout: 120
   check_compatibility: false
+  api_key: "QDRANT_API_KEY"
 
 collection:
   name: "documents"
