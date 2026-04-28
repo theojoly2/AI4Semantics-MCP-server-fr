@@ -1,3 +1,3 @@
-from .old_init import retrieve_documents
+from .retrieve_documents import retrieve_documents
 
 __all__ = ["retrieve_documents"]
