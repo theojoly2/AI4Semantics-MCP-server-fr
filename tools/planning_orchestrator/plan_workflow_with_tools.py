@@ -16,7 +16,7 @@ async def plan_workflow_with_tools(
     # Observations from prior execution steps, to re-plan mid-flight
     observations: list[dict[str, Any]] = None,
     # Budget and safety
-    max_steps: int = 4,
+    max_steps: int = 5,
 ) -> dict:
     """Tool for generating a step-by-step plan to answer a user's question using available planning and executor tools."""
     # 1) Discover tools and split them by tag using an in-memory FastMCP client.
@@ -194,7 +194,7 @@ plan_workflow_with_tools.__doc__ = f"""
     
         max_steps (int):
             The maximum number of planning steps (LLM calls) to perform to arrive at a final plan.
-            Defaults to 4.
+            Defaults to 5.
 
     Returns:
         dict:
