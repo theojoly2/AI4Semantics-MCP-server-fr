@@ -197,7 +197,7 @@ When planning calls to retrieve_documents:
 
 EXAMPLES OF VOCABULARY INFERENCE:
 
-✅ CORRECT - Domain-filtered retrieval:
+CORRECT - Domain-filtered retrieval:
 - Query: "liste moi les standards liés au véhicule"
   → Infer: ["SDG-ISTAT", "SDG-ZFE", "SDG-VFERP", "SDG-IDYN"]
   → Rationale: User asks for vehicle-related standards, which matches SDG-ISTAT (IRVE charging infrastructure), SDG-ZFE (low-emission zones), SDG-VFERP (fleet renewal), SDG-IDYN (dynamic charging data)
@@ -210,7 +210,7 @@ EXAMPLES OF VOCABULARY INFERENCE:
   → Infer: ["SDG-ZFE", "SDG-ISTAT"]
   → Rationale: Low-emission zones (SDG-ZFE), electric vehicle infrastructure (SDG-ISTAT)
 
-❌ INCORRECT - Broad retrieval (exploratory):
+INCORRECT - Broad retrieval (exploratory):
 - Query: "liste TOUS les standards disponibles"
   → Infer: null (broad search across all vocabularies)
   → Rationale: User explicitly asks for a complete inventory without domain restriction
