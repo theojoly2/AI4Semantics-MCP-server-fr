@@ -1,51 +1,4 @@
-import pandas as pd
-from pathlib import Path
-
-def load_vocabulary_guidance():
-    """
-    Charge dynamiquement les vocabulaires depuis vocabularies.xlsx
-    et génère la section de guidance complète avec descriptions.
-    """
-    vocab_file = Path(__file__).resolve().parent.parent / "index_search" / "vocabularies.xlsx"
-    
-    if not vocab_file.exists():
-        print(f"⚠️  Fichier {vocab_file} introuvable, utilisation de la guidance par défaut")
-        return """   No vocabulary metadata available. Use broad search without vocabulary filters unless the user explicitly specifies a vocabulary."""
-    
-    try:
-        df = pd.read_excel(vocab_file)
-        
-        # Générer la liste formatée : vocabulaire + description
-        guidance_lines = []
-        guidance_lines.append("AVAILABLE VOCABULARIES (with descriptions to help you infer relevant ones from user queries):\n")
-        
-        for _, row in df.iterrows():
-            vocab_name = row['NAME']
-            description = str(row['DESCRIPTION']).strip()
-            
-            # Tronquer les descriptions très longues pour éviter de saturer le prompt
-            if len(description) > 300:
-                description = description[:297] + "..."
-            
-            guidance_lines.append(f"   • {vocab_name}: {description}")
-        
-        guidance_lines.append("\nINFERENCE RULES:")
-        guidance_lines.append("   - Read the user's query carefully and identify domain keywords")
-        guidance_lines.append("   - Match those keywords against the vocabulary descriptions above")
-        guidance_lines.append("   - Select 1-3 most relevant vocabularies based on semantic match")
-        guidance_lines.append("   - If multiple vocabularies match equally well, prefer broader ones (Core vocabularies: CAV, CBV, CCCEV, CLV, CPEV, CPOV, CPSV, CPV)")
-        guidance_lines.append("   - If the query is exploratory or domain-ambiguous, omit vocabularies to search broadly")
-        guidance_lines.append("   - Trust the built-in fallback: retrieve_documents will automatically retry without filters if vocabulary-filtered search returns nothing")
-        
-        return '\n'.join(guidance_lines)
-    
-    except Exception as e:
-        print(f"⚠️  Erreur lors du chargement de {vocab_file}: {e}")
-        return """   No vocabulary metadata available. Use broad search without vocabulary filters unless the user explicitly specifies a vocabulary."""
-
-
-# Générer dynamiquement la section de guidance
-VOCABULARY_GUIDANCE = load_vocabulary_guidance()
+from ..index_search.config_loader import VOCABULARY_GUIDANCE
 
 system_prompt_orchestrator = f"""
 # ROLE
@@ -396,4 +349,3 @@ Valid final_plan:
   }}
 }}
 """
-print(system_prompt_orchestrator)

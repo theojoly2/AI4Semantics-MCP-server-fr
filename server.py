@@ -1,16 +1,23 @@
+from dotenv import load_dotenv
+from pathlib import Path
+
+project_dir = Path(__file__).resolve().parent
+env_path = project_dir / ".env"
+
+load_dotenv(dotenv_path=env_path)
+
 from fastmcp import FastMCP
 from fastmcp.tools import Tool
 from fastmcp.server.event_store import EventStore
 import resources
 import tools
-from pathlib import Path
 
-from dotenv import load_dotenv
-project_root = Path(__file__)  # Remonte de 4 niveaux
-env_path = project_root / ".env"
+from tools.index_search.config_loader import VOCABULARIES, VOCABULARY_GUIDANCE
+from tools.index_search.retrieve_documents import retrieve_documents
+from tools.planning_orchestrator.prompts import system_prompt_orchestrator
 
-load_dotenv(dotenv_path=env_path)
-
+print(f"🚀 Serveur démarré avec {len(VOCABULARIES)} vocabulaires en cache")
+print(f"📝 Prompt généré avec {len(VOCABULARY_GUIDANCE)} caractères")
 
 # CHANGE FOR DEPLOYMENT/DEVELOPMENT!
 mcp = FastMCP(

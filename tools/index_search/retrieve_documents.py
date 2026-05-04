@@ -1,5 +1,4 @@
-from typing import List, Tuple, Literal, Optional, Any
-
+from typing import List, Optional, Any, Tuple
 from qdrant_client.models import (
     SparseVector,
     Prefetch,
@@ -15,6 +14,8 @@ try:
 except ImportError:
     from load_documents import config as cf
 
+from .config_loader import VOCABULARIES
+
 client = cf.client
 model = cf.model
 COLLECTION = cf.COLLECTION
@@ -27,159 +28,6 @@ SEARCH_LIMIT: int = int(
     if hasattr(cf, "config")
     else 3
 )
-
-Vocabulary = Literal[
-    "CAV",
-    "CBV",
-    "CCCEV",
-    "CLV",
-    "CPEV",
-    "CPOV",
-    "CPSV",
-    "CPV",
-    "SDG-AC",
-    "SDG-ACM",
-    "SDG-AERP",
-    "SDG-AL",
-    "SDG-AP",
-    "SDG-AV",
-    "SDG-BS",
-    "SDG-BUDG",
-    "SDG-CATAL",
-    "SDG-CDBRRC",
-    "SDG-CMC",
-    "SDG-CMM",
-    "SDG-COLL",
-    "SDG-DAE",
-    "SDG-DECP",
-    "SDG-DELIB",
-    "SDG-DISAI",
-    "SDG-DOCP",
-    "SDG-DONNA",
-    "SDG-DYNA",
-    "SDG-EA",
-    "SDG-ENSPAY",
-    "SDG-EQUIP",
-    "SDG-FONTEA",
-    "SDG-FRI",
-    "SDG-HR",
-    "SDG-IDLL",
-    "SDG-IDT",
-    "SDG-IDYN",
-    "SDG-IR",
-    "SDG-IRA",
-    "SDG-ISPN",
-    "SDG-ISTAT",
-    "SDG-IT",
-    "SDG-LC",
-    "SDG-LDP",
-    "SDG-LSTAT",
-    "SDG-MCOL",
-    "SDG-OA",
-    "SDG-OINS",
-    "SDG-ONP",
-    "SDG-PASSN",
-    "SDG-PEI",
-    "SDG-PMCOLL",
-    "SDG-PNN",
-    "SDG-PROG",
-    "SDG-PTER",
-    "SDG-REA",
-    "SDG-SC",
-    "SDG-SCMS",
-    "SDG-SDIR",
-    "SDG-SECT",
-    "SDG-SEE",
-    "SDG-SEPE",
-    "SDG-SESE",
-    "SDG-SETE",
-    "SDG-SFDPA",
-    "SDG-SMN",
-    "SDG-SP",
-    "SDG-ST",
-    "SDG-SUBV",
-    "SDG-UP",
-    "SDG-VFERP",
-    "SDG-VFERPS",
-    "SDG-ZFE",
-]
-
-VOCABULARIES: List[Vocabulary] = [
-    "CAV",
-    "CBV",
-    "CCCEV",
-    "CLV",
-    "CPEV",
-    "CPOV",
-    "CPSV",
-    "CPV",
-    "SDG-AC",
-    "SDG-ACM",
-    "SDG-AERP",
-    "SDG-AL",
-    "SDG-AP",
-    "SDG-AV",
-    "SDG-BS",
-    "SDG-BUDG",
-    "SDG-CATAL",
-    "SDG-CDBRRC",
-    "SDG-CMC",
-    "SDG-CMM",
-    "SDG-COLL",
-    "SDG-DAE",
-    "SDG-DECP",
-    "SDG-DELIB",
-    "SDG-DISAI",
-    "SDG-DOCP",
-    "SDG-DONNA",
-    "SDG-DYNA",
-    "SDG-EA",
-    "SDG-ENSPAY",
-    "SDG-EQUIP",
-    "SDG-FONTEA",
-    "SDG-FRI",
-    "SDG-HR",
-    "SDG-IDLL",
-    "SDG-IDT",
-    "SDG-IDYN",
-    "SDG-IR",
-    "SDG-IRA",
-    "SDG-ISPN",
-    "SDG-ISTAT",
-    "SDG-IT",
-    "SDG-LC",
-    "SDG-LDP",
-    "SDG-LSTAT",
-    "SDG-MCOL",
-    "SDG-OA",
-    "SDG-OINS",
-    "SDG-ONP",
-    "SDG-PASSN",
-    "SDG-PEI",
-    "SDG-PMCOLL",
-    "SDG-PNN",
-    "SDG-PROG",
-    "SDG-PTER",
-    "SDG-REA",
-    "SDG-SC",
-    "SDG-SCMS",
-    "SDG-SDIR",
-    "SDG-SECT",
-    "SDG-SEE",
-    "SDG-SEPE",
-    "SDG-SESE",
-    "SDG-SETE",
-    "SDG-SFDPA",
-    "SDG-SMN",
-    "SDG-SP",
-    "SDG-ST",
-    "SDG-SUBV",
-    "SDG-UP",
-    "SDG-VFERP",
-    "SDG-VFERPS",
-    "SDG-ZFE",
-]
-
 
 def detect_model_capabilities(model) -> dict[str, Any]:
     """
@@ -287,9 +135,11 @@ def encode_query(query_text: str, capabilities: dict[str, Any]) -> dict[str, Any
 
 def retrieve_documents(
     search_terms: str,
-    vocabularies: Optional[List[Vocabulary]] = None,
-    limit: Optional[int] = None,
-) -> List[Tuple[str, str, float]]:
+    vocabularies: Optional[list[str]] = None,
+    limit: int = 10,
+):
+    if vocabularies is None:
+        vocabularies = VOCABULARIES
     """
     Retrieve relevant documents from Qdrant using:
     - dense search if model is dense-only
