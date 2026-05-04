@@ -5,7 +5,7 @@ import codecs
 import json
 import csv
 from io import StringIO
-from typing import Any
+from typing import Any, Optional
 import xml.etree.ElementTree as ET
 
 from qdrant_client.models import (
@@ -16,7 +16,10 @@ from qdrant_client.models import (
     SparseVector,
 )
 
-import config as cf
+try:
+    from .load_documents import config as cf
+except ImportError:
+    import config as cf
 
 try:
     import xmlschema
@@ -24,16 +27,42 @@ except ImportError:
     xmlschema = None
 
 
+def _extract_vocabulary_from_filename(filename: str) -> Optional[str]:
+    """
+    Extract vocabulary prefix from filename.
+    E.g. 'CPV_AP_SHACL_96.json' -> 'CPV'
+    """
+    if not filename:
+        return None
+    
+    # Liste des vocabulaires valides
+    VOCABULARIES = [
+        "CAV", "CBV", "CCCEV", "CLV", "CPEV", "CPOV", "CPSV", "CPV",
+        "SDG-AC", "SDG-ACM", "SDG-AERP", "SDG-AL", "SDG-AP", "SDG-AV",
+        "SDG-BS", "SDG-BUDG", "SDG-CATAL", "SDG-CDBRRC", "SDG-CMC",
+        "SDG-CMM", "SDG-COLL", "SDG-DAE", "SDG-DECP", "SDG-DELIB",
+        "SDG-DISAI", "SDG-DOCP", "SDG-DONNA", "SDG-DYNA", "SDG-EA",
+        "SDG-ENSPAY", "SDG-EQUIP", "SDG-FONTEA", "SDG-FRI", "SDG-HR",
+        "SDG-IDLL", "SDG-IDT", "SDG-IDYN", "SDG-IR", "SDG-IRA",
+        "SDG-ISPN", "SDG-ISTAT", "SDG-IT", "SDG-LC", "SDG-LDP",
+        "SDG-LSTAT", "SDG-MCOL", "SDG-OA", "SDG-OINS", "SDG-ONP",
+        "SDG-PASSN", "SDG-PEI", "SDG-PMCOLL", "SDG-PNN", "SDG-PROG",
+        "SDG-PTER", "SDG-REA", "SDG-SC", "SDG-SCMS", "SDG-SDIR",
+        "SDG-SECT", "SDG-SEE", "SDG-SEPE", "SDG-SESE", "SDG-SETE",
+        "SDG-SFDPA", "SDG-SMN", "SDG-SP", "SDG-ST", "SDG-SUBV",
+        "SDG-UP", "SDG-VFERP", "SDG-VFERPS", "SDG-ZFE",
+    ]
+    
+    prefix = filename.split("_", 1)[0]
+    return prefix if prefix in VOCABULARIES else None
+
+
 client = cf.client
 model = cf.model
 COLLECTION = cf.COLLECTION
 BATCH_SIZE = cf.BATCH_SIZE
 
-XML_DECL_RE = re.compile(
-    br'<\?xml[^>]*encoding=["\']([A-Za-z0-9._\-]+)["\']',
-    re.IGNORECASE
-)
-
+XML_DECL_RE = re.compile(br'<\?xml[^>]+encoding\s*=\s*["\']([^"\']+)', re.IGNORECASE)
 TEXT_BOMS = (
     codecs.BOM_UTF8,
     codecs.BOM_UTF16_LE,
@@ -41,8 +70,7 @@ TEXT_BOMS = (
     codecs.BOM_UTF32_LE,
     codecs.BOM_UTF32_BE,
 )
-
-TEXT_WHITELIST = set(b"\n\r\t\f\b")
+TEXT_WHITELIST = set(b"\t\n\r")
 PRINTABLE_ASCII = set(range(32, 127))
 
 DENSE_VECTOR_NAME = "dense"
@@ -50,20 +78,21 @@ SPARSE_VECTOR_NAME = "sparse"
 
 XML_SPLIT_THRESHOLD = 180_000
 XML_MAX_CHUNK_CHARS = 120_000
-
-XML_GLOBAL_COMPONENT_TAGS = {
+XML_GLOBAL_COMPONENT_TAGS = (
     "complexType",
     "simpleType",
     "element",
     "group",
     "attributeGroup",
     "attribute",
-}
-
-XSD_REL_ATTRS = {"base", "ref", "type", "substitutionGroup"}
+)
+XSD_REL_ATTRS = ("base", "ref", "type", "substitutionGroup")
 
 
 def detect_model_capabilities(model) -> dict[str, Any]:
+    """
+    Detect if the loaded model supports dense vectors, sparse vectors, or both.
+    """
     capabilities = {
         "has_dense": False,
         "has_sparse": False,
@@ -94,11 +123,13 @@ def detect_model_capabilities(model) -> dict[str, Any]:
                 capabilities["has_sparse"] = True
 
             print(
-                f"✓ Model capabilities detected: dense={capabilities['has_dense']}, "
+                f"Model capabilities detected: "
+                f"dense={capabilities['has_dense']}, "
                 f"sparse={capabilities['has_sparse']}, "
                 f"dense_dim={capabilities['dense_dim']}"
             )
             return capabilities
+
     except Exception:
         pass
 
@@ -108,7 +139,7 @@ def detect_model_capabilities(model) -> dict[str, Any]:
         capabilities["has_dense"] = True
         capabilities["dense_dim"] = len(first_dense)
         print(
-            f"✓ Model capabilities detected: dense=True, sparse=False, "
+            f"Model capabilities detected: dense=True, sparse=False, "
             f"dense_dim={capabilities['dense_dim']}"
         )
         return capabilities
@@ -166,8 +197,8 @@ def is_probably_binary(filepath: Path, chunk_size: int = 4096) -> bool:
 
 
 def guess_text_encodings(raw: bytes) -> list[str]:
-    candidates: list[str] = []
-
+    candidates = []
+    
     bom_encoding = detect_bom_encoding(raw)
     if bom_encoding:
         candidates.append(bom_encoding)
@@ -195,6 +226,7 @@ def guess_text_encodings(raw: bytes) -> list[str]:
         if enc and enc not in seen:
             deduped.append(enc)
             seen.add(enc)
+
     return deduped
 
 
@@ -215,7 +247,8 @@ def read_text_document(filepath: Path) -> tuple[str, str]:
             continue
 
     raise ValueError(
-        f"Unable to decode file '{filepath.name}'. Tried encodings: {', '.join(encodings_to_try)}"
+        f"Unable to decode file {filepath.name}. "
+        f"Tried encodings: {', '.join(encodings_to_try)}"
     )
 
 
@@ -229,10 +262,13 @@ def optimize_json_preserving_standards(data: Any) -> str:
                 else:
                     out[k] = transform(v)
             return out
+
         if isinstance(obj, list):
             return [transform(item) for item in obj]
+
         if isinstance(obj, str):
             return obj.strip()
+
         return obj
 
     optimized = transform(data)
@@ -258,7 +294,7 @@ def optimize_xml_preserving_standards(xml_content: str) -> str:
         return compact.strip()
 
 
-def optimize_rdf_like_text(content: str) -> str:
+def optimize_rdflike_text(content: str) -> str:
     lines = []
     previous_blank = False
 
@@ -268,12 +304,12 @@ def optimize_rdf_like_text(content: str) -> str:
         if not stripped:
             if not previous_blank:
                 lines.append("")
-            previous_blank = True
+                previous_blank = True
             continue
 
         previous_blank = False
 
-        if stripped.startswith("#"):
+        if stripped.startswith("@"):
             lines.append(stripped)
             continue
 
@@ -302,6 +338,7 @@ def optimize_csv_content(text: str) -> str:
         reader = csv.reader(StringIO(text))
         output = StringIO()
         writer = csv.writer(output, lineterminator="\n")
+
         for row in reader:
             if not row:
                 continue
@@ -309,6 +346,7 @@ def optimize_csv_content(text: str) -> str:
             if not any(cleaned):
                 continue
             writer.writerow(cleaned)
+
         return output.getvalue().strip()
     except Exception:
         lines = []
@@ -333,11 +371,13 @@ def optimize_markdown_content(text: str) -> str:
 
     for line in text.splitlines():
         stripped = line.rstrip()
+
         if not stripped.strip():
             if not previous_blank:
                 lines.append("")
-            previous_blank = True
+                previous_blank = True
             continue
+
         lines.append(stripped)
         previous_blank = False
 
@@ -350,18 +390,20 @@ def optimize_generic_text(text: str) -> str:
 
     for line in text.splitlines():
         stripped = line.rstrip()
+
         if not stripped.strip():
             if not previous_blank:
                 lines.append("")
-            previous_blank = True
+                previous_blank = True
             continue
-        lines.append(re.sub(r"[ \t]+", " ", stripped))
+
+        lines.append(re.sub(r"\s+", " ", stripped))
         previous_blank = False
 
     return "\n".join(lines).strip()
 
 
-def local_name(tag: str) -> str:
+def localname(tag: str) -> str:
     return tag.split("}", 1)[1] if "}" in tag else tag
 
 
@@ -372,7 +414,7 @@ def strip_prefix(value: str) -> str:
 def collect_documentation_text(elem: ET.Element) -> list[str]:
     docs = []
     for sub in elem.iter():
-        if local_name(sub.tag) == "documentation":
+        if localname(sub.tag) == "documentation":
             text = " ".join("".join(sub.itertext()).split())
             if text:
                 docs.append(text)
@@ -382,7 +424,7 @@ def collect_documentation_text(elem: ET.Element) -> list[str]:
 def collect_appinfo_text(elem: ET.Element) -> list[str]:
     appinfos = []
     for sub in elem.iter():
-        if local_name(sub.tag) == "appinfo":
+        if localname(sub.tag) == "appinfo":
             text = " ".join("".join(sub.itertext()).split())
             if text:
                 appinfos.append(text)
@@ -398,23 +440,23 @@ def extract_xsd_dependencies_from_element(elem: ET.Element) -> dict[str, list[st
         "ref": [],
         "type": [],
         "substitutionGroup": [],
-        "group_ref": [],
-        "attributeGroup_ref": [],
+        "groupref": [],
+        "attributeGroupref": [],
     }
 
     for sub in elem.iter():
-        tag = local_name(sub.tag)
+        tag = localname(sub.tag)
 
         for attr_key, attr_value in sub.attrib.items():
-            attr_name = local_name(attr_key)
+            attr_name = localname(attr_key)
             if attr_name in XSD_REL_ATTRS and attr_value:
                 deps[attr_name].append(strip_prefix(attr_value))
 
         if tag == "group" and "ref" in sub.attrib:
-            deps["group_ref"].append(strip_prefix(sub.attrib["ref"]))
+            deps["groupref"].append(strip_prefix(sub.attrib["ref"]))
 
         if tag == "attributeGroup" and "ref" in sub.attrib:
-            deps["attributeGroup_ref"].append(strip_prefix(sub.attrib["ref"]))
+            deps["attributeGroupref"].append(strip_prefix(sub.attrib["ref"]))
 
     cleaned = {}
     for key, values in deps.items():
@@ -429,12 +471,12 @@ def extract_xsd_dependencies_from_element(elem: ET.Element) -> dict[str, list[st
     return cleaned
 
 
-def summarize_dependencies(dep_map: dict[str, list[str]]) -> tuple[list[str], list[str]]:
+def summarize_dependencies(depmap: dict[str, list[str]]) -> tuple[list[str], list[str]]:
     flat = []
     labeled = []
 
-    for rel_type in ["base", "type", "ref", "substitutionGroup", "group_ref", "attributeGroup_ref"]:
-        for item in dep_map.get(rel_type, []):
+    for rel_type in ["base", "type", "ref", "substitutionGroup", "groupref", "attributeGroupref"]:
+        for item in depmap.get(rel_type, []):
             flat.append(item)
             labeled.append(f"{rel_type}:{item}")
 
@@ -464,8 +506,9 @@ def extract_schema_link_directives(root: ET.Element) -> dict[str, list[str]]:
     }
 
     for child in list(root):
-        tag = local_name(child.tag)
+        tag = localname(child.tag)
         schema_loc = child.attrib.get("schemaLocation")
+
         if not schema_loc:
             continue
 
@@ -490,7 +533,9 @@ def extract_schema_link_directives(root: ET.Element) -> dict[str, list[str]]:
     return links
 
 
-def resolve_local_schema_links(filepath: Path, schema_links: dict[str, list[str]]) -> dict[str, list[str]]:
+def resolve_local_schema_links(
+    filepath: Path, schema_links: dict[str, list[str]]
+) -> dict[str, list[str]]:
     resolved = {
         "includes": [],
         "imports": [],
@@ -498,10 +543,11 @@ def resolve_local_schema_links(filepath: Path, schema_links: dict[str, list[str]
         "overrides": [],
     }
 
-    base_dir = filepath.parent
+    basedir = filepath.parent
+
     for key, items in schema_links.items():
         for item in items:
-            candidate = (base_dir / item).resolve()
+            candidate = (basedir / item).resolve()
             if candidate.exists():
                 resolved[key].append(str(candidate))
             else:
@@ -510,17 +556,25 @@ def resolve_local_schema_links(filepath: Path, schema_links: dict[str, list[str]
     return resolved
 
 
-def build_component_registry_etree(root: ET.Element, filepath: Path) -> list[dict[str, Any]]:
+def build_component_registry_etree(
+    root: ET.Element, filepath: Path
+) -> list[dict[str, Any]]:
     registry = []
 
     for child in list(root):
-        kind = local_name(child.tag)
+        kind = localname(child.tag)
+
         if kind not in XML_GLOBAL_COMPONENT_TAGS:
             continue
 
-        name = child.attrib.get("name") or child.attrib.get("ref") or child.attrib.get("id")
+        name = (
+            child.attrib.get("name")
+            or child.attrib.get("ref")
+            or child.attrib.get("id")
+        )
+
         if not name:
-            name = f"anonymous_{len(registry) + 1}"
+            name = f"anonymous_{len(registry)+1}"
 
         xml_text = ET.tostring(child, encoding="unicode", method="xml")
         xml_text = optimize_xml_preserving_standards(xml_text)
@@ -528,24 +582,28 @@ def build_component_registry_etree(root: ET.Element, filepath: Path) -> list[dic
         dep_map = extract_xsd_dependencies_from_element(child)
         depends_on, depends_on_labeled = summarize_dependencies(dep_map)
 
-        registry.append({
-            "component_id": f"{kind}:{strip_prefix(name)}",
-            "component_name": strip_prefix(name),
-            "component_kind": kind,
-            "target_namespace": root.attrib.get("targetNamespace", ""),
-            "schema_file": filepath.name,
-            "xml": xml_text,
-            "documentation": collect_documentation_text(child),
-            "appinfo": collect_appinfo_text(child),
-            "dep_map": dep_map,
-            "depends_on": depends_on,
-            "depends_on_labeled": depends_on_labeled,
-        })
+        registry.append(
+            {
+                "componentid": f"{kind}:{strip_prefix(name)}",
+                "componentname": strip_prefix(name),
+                "componentkind": kind,
+                "targetnamespace": root.attrib.get("targetNamespace", ""),
+                "schemafile": filepath.name,
+                "xml": xml_text,
+                "documentation": collect_documentation_text(child),
+                "appinfo": collect_appinfo_text(child),
+                "depmap": dep_map,
+                "dependson": depends_on,
+                "dependsonlabeled": depends_on_labeled,
+            }
+        )
 
     return registry
 
 
-def build_component_registry_xmlschema(filepath: Path) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+def build_component_registry_xmlschema(
+    filepath: Path,
+) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
     if xmlschema is None:
         return [], {}
 
@@ -558,7 +616,9 @@ def build_component_registry_xmlschema(filepath: Path) -> tuple[list[dict[str, A
 
     try:
         root_elem = ET.fromstring(filepath.read_text(encoding="utf-8", errors="ignore"))
-        schema_links = resolve_local_schema_links(filepath, extract_schema_link_directives(root_elem))
+        schema_links = resolve_local_schema_links(
+            filepath, extract_schema_link_directives(root_elem)
+        )
     except Exception:
         schema_links = {"includes": [], "imports": [], "redefines": [], "overrides": []}
 
@@ -569,7 +629,10 @@ def build_component_registry_xmlschema(filepath: Path) -> tuple[list[dict[str, A
         if not name:
             continue
 
-        target_namespace = getattr(component, "target_namespace", "") or getattr(schema, "target_namespace", "")
+        target_namespace = getattr(component, "target_namespace", None) or getattr(
+            schema, "target_namespace", ""
+        )
+
         component_id = f"{cls_name}:{strip_prefix(name)}"
 
         xml_text = ""
@@ -588,8 +651,8 @@ def build_component_registry_xmlschema(filepath: Path) -> tuple[list[dict[str, A
             "ref": [],
             "type": [],
             "substitutionGroup": [],
-            "group_ref": [],
-            "attributeGroup_ref": [],
+            "groupref": [],
+            "attributeGroupref": [],
         }
 
         if elem is not None:
@@ -599,32 +662,35 @@ def build_component_registry_xmlschema(filepath: Path) -> tuple[list[dict[str, A
 
         depends_on, depends_on_labeled = summarize_dependencies(dep_map)
 
-        registry.append({
-            "component_id": component_id,
-            "component_name": strip_prefix(name),
-            "component_kind": cls_name,
-            "target_namespace": target_namespace,
-            "schema_file": filepath.name,
-            "xml": xml_text,
-            "documentation": documentation,
-            "appinfo": appinfo,
-            "dep_map": dep_map,
-            "depends_on": depends_on,
-            "depends_on_labeled": depends_on_labeled,
-        })
+        registry.append(
+            {
+                "componentid": component_id,
+                "componentname": strip_prefix(name),
+                "componentkind": cls_name,
+                "targetnamespace": target_namespace,
+                "schemafile": filepath.name,
+                "xml": xml_text,
+                "documentation": documentation,
+                "appinfo": appinfo,
+                "depmap": dep_map,
+                "dependson": depends_on,
+                "dependsonlabeled": depends_on_labeled,
+            }
+        )
 
     return registry, schema_links
 
 
 def build_reverse_references(registry: list[dict[str, Any]]) -> dict[str, list[str]]:
-    reverse: dict[str, list[str]] = {}
+    reverse = {}
 
     for item in registry:
-        source_id = item["component_id"]
-        source_name = item["component_name"]
+        source_id = item["componentid"]
+        source_name = item["componentname"]
+
         reverse.setdefault(source_name, [])
 
-        for dep in item["depends_on"]:
+        for dep in item["dependson"]:
             reverse.setdefault(dep, []).append(source_id)
 
     for key, refs in reverse.items():
@@ -646,177 +712,177 @@ def build_parent_xml_summary(
     reverse_refs: dict[str, list[str]],
     schema_links: dict[str, list[str]],
 ) -> str:
-    counts: dict[str, int] = {}
+    counts = {}
     all_ids = []
 
     for item in registry:
-        counts[item["component_kind"]] = counts.get(item["component_kind"], 0) + 1
-        all_ids.append(item["component_id"])
+        counts[item["componentkind"]] = counts.get(item["componentkind"], 0) + 1
+        all_ids.append(item["componentid"])
 
-    counts_text = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "none"
-    ids_text = ", ".join(all_ids[:40]) + (", ..." if len(all_ids) > 40 else "")
+    counts_text = ", ".join(f"{k}:{v}" for k, v in sorted(counts.items())) or "none"
+    ids_text = (
+        ", ".join(all_ids[:40]) + ", ..." if len(all_ids) > 40 else ", ".join(all_ids)
+    )
 
     most_referenced = sorted(
-        ((name, len(refs)) for name, refs in reverse_refs.items() if refs),
+        [(name, len(refs)) for name, refs in reverse_refs.items() if refs],
         key=lambda x: x[1],
         reverse=True,
     )
-    most_referenced_text = ", ".join(f"{name}({count})" for name, count in most_referenced[:20]) or "none"
-
-    return (
-        "[XML_DOCUMENT_SUMMARY]\n"
-        f"SOURCE_DOCUMENT: {filepath.name}\n"
-        f"ROOT_ELEMENT: {root_tag}\n"
-        f"TOTAL_COMPONENTS: {len(registry)}\n"
-        f"COMPONENT_BREAKDOWN: {counts_text}\n"
-        f"KNOWN_COMPONENTS: {ids_text}\n"
-        f"INCLUDES: {', '.join(schema_links.get('includes', [])) or 'none'}\n"
-        f"IMPORTS: {', '.join(schema_links.get('imports', [])) or 'none'}\n"
-        f"REDEFINES: {', '.join(schema_links.get('redefines', [])) or 'none'}\n"
-        f"OVERRIDES: {', '.join(schema_links.get('overrides', [])) or 'none'}\n"
-        f"MOST_REFERENCED_COMPONENTS: {most_referenced_text}\n"
-        "NOTE: Parent summary of a larger XML/XSD standard, split into semantic chunks while preserving raw XML and schema relations.\n"
-        "[/XML_DOCUMENT_SUMMARY]"
+    most_referenced_text = (
+        ", ".join(f"{name}({count})" for name, count in most_referenced[:20]) or "none"
     )
+
+    return f"""--- XML DOCUMENT SUMMARY ---
+SOURCE DOCUMENT: {filepath.name}
+ROOT ELEMENT: {root_tag}
+TOTAL COMPONENTS: {len(registry)}
+COMPONENT BREAKDOWN: {counts_text}
+KNOWN COMPONENTS: {ids_text}
+INCLUDES: {", ".join(schema_links.get("includes", [])) or "none"}
+IMPORTS: {", ".join(schema_links.get("imports", [])) or "none"}
+REDEFINES: {", ".join(schema_links.get("redefines", [])) or "none"}
+OVERRIDES: {", ".join(schema_links.get("overrides", [])) or "none"}
+MOST REFERENCED COMPONENTS: {most_referenced_text}
+
+NOTE: Parent summary of a larger XML/XSD standard, split into semantic chunks while preserving raw XML and schema relations.
+--- XML DOCUMENT SUMMARY ---"""
 
 
 def build_xml_chunk_text(
     item: dict[str, Any],
     source_file: str,
-    previous_chunk: str | None,
-    next_chunk: str | None,
-    referenced_by: list[str],
-    schema_links: dict[str, list[str]],
+    previous_chunk: str | None = None,
+    next_chunk: str | None = None,
+    referenced_by: list[str] = [],
+    schema_links: dict[str, list[str]] = {},
 ) -> str:
-    docs_text = " | ".join(item["documentation"][:5]) if item["documentation"] else "none"
-    appinfo_text = " | ".join(item["appinfo"][:3]) if item["appinfo"] else "none"
-    deps_text = ", ".join(item["depends_on_labeled"][:25]) if item["depends_on_labeled"] else "none"
+    docs_text = " ".join(item["documentation"][:5]) if item["documentation"] else "none"
+    appinfo_text = " ".join(item["appinfo"][:3]) if item["appinfo"] else "none"
+    deps_text = (
+        ", ".join(item["dependsonlabeled"][:25])
+        if item["dependsonlabeled"]
+        else "none"
+    )
     refs_text = ", ".join(referenced_by[:25]) if referenced_by else "none"
 
-    header = (
-        "[XML_CHUNK_CONTEXT]\n"
-        f"SOURCE_DOCUMENT: {source_file}\n"
-        f"COMPONENT_ID: {item['component_id']}\n"
-        f"COMPONENT_KIND: {item['component_kind']}\n"
-        f"COMPONENT_NAME: {item['component_name']}\n"
-        f"TARGET_NAMESPACE: {item['target_namespace'] or 'none'}\n"
-        f"SCHEMA_FILE: {item['schema_file']}\n"
-        f"PREVIOUS_CHUNK: {previous_chunk or 'none'}\n"
-        f"NEXT_CHUNK: {next_chunk or 'none'}\n"
-        f"DEPENDS_ON_LABELED: {deps_text}\n"
-        f"REFERENCED_BY: {refs_text}\n"
-        f"INCLUDES: {', '.join(schema_links.get('includes', [])) or 'none'}\n"
-        f"IMPORTS: {', '.join(schema_links.get('imports', [])) or 'none'}\n"
-        f"REDEFINES: {', '.join(schema_links.get('redefines', [])) or 'none'}\n"
-        f"OVERRIDES: {', '.join(schema_links.get('overrides', [])) or 'none'}\n"
-        f"DOCUMENTATION: {docs_text}\n"
-        f"APPINFO: {appinfo_text}\n"
-        "[/XML_CHUNK_CONTEXT]\n\n"
-    )
+    header = f"""--- XML CHUNK CONTEXT ---
+SOURCE DOCUMENT: {source_file}
+COMPONENT ID: {item["componentid"]}
+COMPONENT KIND: {item["componentkind"]}
+COMPONENT NAME: {item["componentname"]}
+TARGET NAMESPACE: {item["targetnamespace"] or "none"}
+SCHEMA FILE: {item["schemafile"]}
+PREVIOUS CHUNK: {previous_chunk or "none"}
+NEXT CHUNK: {next_chunk or "none"}
+DEPENDS ON (LABELED): {deps_text}
+REFERENCED BY: {refs_text}
+INCLUDES: {", ".join(schema_links.get("includes", [])) or "none"}
+IMPORTS: {", ".join(schema_links.get("imports", [])) or "none"}
+REDEFINES: {", ".join(schema_links.get("redefines", [])) or "none"}
+OVERRIDES: {", ".join(schema_links.get("overrides", [])) or "none"}
+DOCUMENTATION: {docs_text}
+APPINFO: {appinfo_text}
+--- XML CHUNK CONTEXT ---
 
-    body = item["xml"] or "[NO_RAW_XML_COMPONENT_AVAILABLE]"
+"""
 
-    footer = (
-        "\n\n[XML_CHUNK_RELATIONS]\n"
-        f"SOURCE_DOCUMENT: {source_file}\n"
-        f"COMPONENT_ID: {item['component_id']}\n"
-        f"DEPENDS_ON_LABELED: {deps_text}\n"
-        f"REFERENCED_BY: {refs_text}\n"
-        "NOTE: This chunk preserves raw XML plus extracted schema relations and annotations.\n"
-        "[/XML_CHUNK_RELATIONS]"
-    )
+    body = item["xml"] or "<!-- NO RAW XML COMPONENT AVAILABLE -->"
+
+    footer = f"""
+
+--- XML CHUNK RELATIONS ---
+SOURCE DOCUMENT: {source_file}
+COMPONENT ID: {item["componentid"]}
+DEPENDS ON (LABELED): {deps_text}
+REFERENCED BY: {refs_text}
+
+NOTE: This chunk preserves raw XML plus extracted schema relations and annotations.
+--- XML CHUNK RELATIONS ---"""
 
     final_text = header + body + footer
 
     if len(final_text) > XML_MAX_CHUNK_CHARS:
-        abstract = (
-            "[XML_COMPONENT_ABSTRACT]\n"
-            f"COMPONENT_ID: {item['component_id']}\n"
-            f"COMPONENT_KIND: {item['component_kind']}\n"
-            f"COMPONENT_NAME: {item['component_name']}\n"
-            f"TARGET_NAMESPACE: {item['target_namespace'] or 'none'}\n"
-            f"DOCUMENTATION: {docs_text}\n"
-            f"APPINFO: {appinfo_text}\n"
-            f"DEPENDENCIES: {deps_text}\n"
-            "[/XML_COMPONENT_ABSTRACT]\n\n"
-        )
+        abstract = f"""--- XML COMPONENT ABSTRACT ---
+COMPONENT ID: {item["componentid"]}
+COMPONENT KIND: {item["componentkind"]}
+COMPONENT NAME: {item["componentname"]}
+TARGET NAMESPACE: {item["targetnamespace"] or "none"}
+DOCUMENTATION: {docs_text}
+APPINFO: {appinfo_text}
+DEPENDENCIES: {deps_text}
+--- XML COMPONENT ABSTRACT ---
+
+"""
         final_text = header + abstract + body[:90000] + footer
 
     return final_text
 
 
 def detect_xml_type(root: ET.Element) -> str:
-    """Détermine si c'est un XSD, du XMI/UML, ou un document XML d'instance"""
-    root_tag = local_name(root.tag)
-    
-    # XMI/UML
+    """Détermine si c'est un XSD, du XMI/UML, ou un document XML d'instance."""
+    root_tag = localname(root.tag)
+
     if root_tag in ("XMI", "Model", "uml:Model"):
         return "xmi"
-    
-    # Détecte XMI par attributs
+
     for attr_name in root.attrib.keys():
-        if 'xmi' in attr_name.lower():
+        if "xmi" in attr_name.lower():
             return "xmi"
-    
-    # Détecte XMI par enfants
+
     has_uml_elements = False
-    for child in list(root)[:10]:  # Check premiers enfants
+    for child in list(root)[:10]:
         tag_lower = child.tag.lower()
-        if 'uml:' in child.tag or 'packagedelement' in tag_lower or 'xmi' in tag_lower:
+        if "uml" in child.tag or "packagedelement" in tag_lower or "xmi" in tag_lower:
             has_uml_elements = True
             break
-    
+
     if has_uml_elements:
         return "xmi"
-    
-    # XSD schema
+
     if root_tag == "schema":
         return "xsd"
-    
-    # Cherche des composants XSD dans les enfants
+
     has_xsd_components = any(
-        local_name(child.tag) in XML_GLOBAL_COMPONENT_TAGS
-        for child in root
+        localname(child.tag) in XML_GLOBAL_COMPONENT_TAGS for child in root
     )
-    
     if has_xsd_components:
         return "xsd"
-    
-    return "xml_instance"
+
+    return "xmlinstance"
 
 
 def extract_uml_element_info(elem: ET.Element) -> dict[str, Any]:
-    """Extrait les infos importantes d'un élément UML"""
-    tag = local_name(elem.tag)
-    
-    # Cherche les attributs XMI standards
+    """Extrait les infos importantes d'un élément UML."""
+    tag = localname(elem.tag)
+
     xmi_type = (
-        elem.attrib.get("{http://schema.omg.org/spec/XMI/2.1}type") or
-        elem.attrib.get("{http://www.omg.org/spec/XMI/20131001}type") or
-        elem.attrib.get("{http://www.omg.org/XMI}type") or
-        elem.attrib.get("type") or
-        tag
+        elem.attrib.get("{http://schema.omg.org/spec/XMI/2.1}type")
+        or elem.attrib.get("{http://www.omg.org/spec/XMI/20131001}type")
+        or elem.attrib.get("{http://www.omg.org/XMI}type")
+        or elem.attrib.get("type")
+        or tag
     )
-    
+
     xmi_id = (
-        elem.attrib.get("{http://schema.omg.org/spec/XMI/2.1}id") or
-        elem.attrib.get("{http://www.omg.org/spec/XMI/20131001}id") or
-        elem.attrib.get("{http://www.omg.org/XMI}id") or
-        elem.attrib.get("id")
+        elem.attrib.get("{http://schema.omg.org/spec/XMI/2.1}id")
+        or elem.attrib.get("{http://www.omg.org/spec/XMI/20131001}id")
+        or elem.attrib.get("{http://www.omg.org/XMI}id")
+        or elem.attrib.get("id")
     )
-    
+
     name = elem.attrib.get("name") or xmi_id or f"anonymous_{tag}"
-    
+
     return {
         "tag": tag,
-        "xmi_type": strip_prefix(xmi_type),
-        "xmi_id": xmi_id,
+        "xmitype": strip_prefix(xmi_type),
+        "xmiid": xmi_id,
         "name": name,
     }
 
 
 def collect_uml_dependencies(elem: ET.Element) -> dict[str, list[str]]:
-    """Collecte les dépendances UML (types, associations, généralisations, etc.)"""
+    """Collecte les dépendances UML: types, associations, généralisations, etc."""
     deps = {
         "type": [],
         "association": [],
@@ -826,40 +892,32 @@ def collect_uml_dependencies(elem: ET.Element) -> dict[str, list[str]]:
         "aggregation": [],
         "idref": [],
     }
-    
-    # Parcourt tous les sous-éléments
+
     for sub in elem.iter():
-        # Attribut 'type' référence un autre élément
         type_ref = sub.attrib.get("type")
         if type_ref:
             deps["type"].append(strip_prefix(type_ref))
-        
-        # Association
+
         assoc = sub.attrib.get("association")
         if assoc:
             deps["association"].append(strip_prefix(assoc))
-        
-        # Generalization/specialization
+
         general = sub.attrib.get("general")
         if general:
             deps["generalization"].append(strip_prefix(general))
-        
-        # Realization
+
         supplier = sub.attrib.get("supplier")
         if supplier:
             deps["realization"].append(strip_prefix(supplier))
-        
-        # Dependency
+
         client = sub.attrib.get("client")
         if client:
             deps["dependency"].append(strip_prefix(client))
-        
-        # Idref (références XMI génériques)
+
         idref = sub.attrib.get("idref") or sub.attrib.get("href")
         if idref:
             deps["idref"].append(strip_prefix(idref))
-    
-    # Déduplique
+
     cleaned = {}
     for key, values in deps.items():
         seen = set()
@@ -869,34 +927,30 @@ def collect_uml_dependencies(elem: ET.Element) -> dict[str, list[str]]:
                 seen.add(v)
                 uniq.append(v)
         cleaned[key] = uniq
-    
+
     return cleaned
 
 
-def split_xmi_by_packaged_elements(filepath: Path, root: ET.Element) -> list[dict[str, Any]]:
-    """
-    Découpe un fichier XMI par packagedElement (classes, packages, associations, etc.)
-    """
-    results: list[dict[str, Any]] = []
-    
-    # Collecte tous les packagedElement de niveau supérieur
-    packaged_elements = []
-    
-    def collect_packaged_elements(parent: ET.Element, depth: int = 0):
-        """Collecte récursivement les packagedElement importants"""
+def split_xmi_by_packagedelements(
+    filepath: Path, root: ET.Element
+) -> list[dict[str, Any]]:
+    """Découpe un fichier XMI par packagedElement (classes, packages, associations, etc.)."""
+    results = []
+    packagedelements = []
+
+    def collect_packagedelements(parent: ET.Element, depth: int = 0):
+        """Collecte récursivement les packagedElement importants."""
         for child in parent:
-            tag = local_name(child.tag)
-            
-            # packagedElement est le conteneur standard UML
-            if tag == "packagedElement" or 'packagedElement' in child.tag:
+            tag = localname(child.tag)
+
+            if tag == "packagedElement" or "packagedElement" in child.tag:
                 info = extract_uml_element_info(child)
                 xml_text = ET.tostring(child, encoding="unicode", method="xml")
                 xml_text = optimize_xml_preserving_standards(xml_text)
-                
-                # Skip si trop petit
+
                 if len(xml_text) < 3000:
                     continue
-                
+
                 deps = collect_uml_dependencies(child)
                 deps_flat = []
                 deps_labeled = []
@@ -904,289 +958,310 @@ def split_xmi_by_packaged_elements(filepath: Path, root: ET.Element) -> list[dic
                     for item in items:
                         deps_flat.append(item)
                         deps_labeled.append(f"{rel_type}:{item}")
-                
-                # Déduplique
+
                 deps_flat = list(dict.fromkeys(deps_flat))
                 deps_labeled = list(dict.fromkeys(deps_labeled))
-                
-                packaged_elements.append({
-                    "tag": info["tag"],
-                    "xmi_type": info["xmi_type"],
-                    "xmi_id": info["xmi_id"],
-                    "name": info["name"],
-                    "xml": xml_text,
-                    "depth": depth,
-                    "depends_on": deps_flat,
-                    "depends_on_labeled": deps_labeled,
-                    "index": len(packaged_elements),
-                })
-            
-            # Descend récursivement si package ou model
+
+                packagedelements.append(
+                    {
+                        "tag": info["tag"],
+                        "xmitype": info["xmitype"],
+                        "xmiid": info["xmiid"],
+                        "name": info["name"],
+                        "xml": xml_text,
+                        "depth": depth,
+                        "dependson": deps_flat,
+                        "dependsonlabeled": deps_labeled,
+                        "index": len(packagedelements),
+                    }
+                )
+
             if tag in ("packagedElement", "Model", "Package") and depth < 3:
-                collect_packaged_elements(child, depth + 1)
-    
-    collect_packaged_elements(root)
-    
-    # Si pas assez d'éléments, ne découpe pas
-    if len(packaged_elements) < 2:
+                collect_packagedelements(child, depth + 1)
+
+    collect_packagedelements(root)
+
+    if len(packagedelements) < 2:
         return []
-    
-    # Crée un index inverse (qui référence quoi)
-    reverse_refs: dict[str, list[str]] = {}
-    for elem in packaged_elements:
-        elem_id = elem["xmi_id"] or elem["name"]
-        for dep in elem["depends_on"]:
+
+    reverse_refs = {}
+    for elem in packagedelements:
+        elem_id = elem["xmiid"] or elem["name"]
+        for dep in elem["dependson"]:
             reverse_refs.setdefault(dep, []).append(elem_id)
-    
-    # Parent summary
+
     root_info = extract_uml_element_info(root)
+
     element_types = {}
-    for elem in packaged_elements:
-        element_types[elem["xmi_type"]] = element_types.get(elem["xmi_type"], 0) + 1
-    
-    types_text = ", ".join(f"{k}={v}" for k, v in sorted(element_types.items())) or "none"
-    ids_text = ", ".join(e["xmi_id"] or e["name"] for e in packaged_elements[:40])
-    if len(packaged_elements) > 40:
+    for elem in packagedelements:
+        element_types[elem["xmitype"]] = element_types.get(elem["xmitype"], 0) + 1
+
+    types_text = ", ".join(f"{k}:{v}" for k, v in sorted(element_types.items())) or "none"
+    ids_text = ", ".join(
+        [e["xmiid"] or e["name"] for e in packagedelements[:40]]
+    )
+    if len(packagedelements) > 40:
         ids_text += ", ..."
-    
+
     most_referenced = sorted(
-        ((name, len(refs)) for name, refs in reverse_refs.items() if refs),
+        [(name, len(refs)) for name, refs in reverse_refs.items() if refs],
         key=lambda x: x[1],
         reverse=True,
     )
-    most_referenced_text = ", ".join(f"{name}({count})" for name, count in most_referenced[:20]) or "none"
-    
-    parent_summary = (
-        "[XMI_DOCUMENT_SUMMARY]\n"
-        f"SOURCE_DOCUMENT: {filepath.name}\n"
-        f"ROOT_ELEMENT: {root_info['tag']}\n"
-        f"ROOT_XMI_TYPE: {root_info['xmi_type']}\n"
-        f"ROOT_NAME: {root_info['name']}\n"
-        f"TOTAL_PACKAGED_ELEMENTS: {len(packaged_elements)}\n"
-        f"ELEMENT_TYPE_BREAKDOWN: {types_text}\n"
-        f"KNOWN_ELEMENTS: {ids_text}\n"
-        f"MOST_REFERENCED_ELEMENTS: {most_referenced_text}\n"
-        "NOTE: This is a parent summary of a UML/XMI model split by packagedElement while preserving raw XML and UML relations.\n"
-        "[/XMI_DOCUMENT_SUMMARY]"
+    most_referenced_text = (
+        ", ".join(f"{name}({count})" for name, count in most_referenced[:20]) or "none"
     )
-    
-    results.append({
-        "filename": f"{filepath.stem}__PARENT_SUMMARY.xmichunk",
-        "text": parent_summary,
-        "payload_extra": {
-            "doc_type": "xmi_parent_summary",
-            "component_id": None,
-            "component_kind": root_info["xmi_type"],
-            "component_name": root_info["name"],
-            "target_namespace": root.attrib.get("targetNamespace"),
-            "depends_on": [],
-            "depends_on_labeled": [],
-            "referenced_by": [],
-            "schema_links": {},
+
+    parent_summary = f"""--- XMI DOCUMENT SUMMARY ---
+SOURCE DOCUMENT: {filepath.name}
+ROOT ELEMENT: {root_info["tag"]}
+ROOT XMI TYPE: {root_info["xmitype"]}
+ROOT NAME: {root_info["name"]}
+TOTAL PACKAGED ELEMENTS: {len(packagedelements)}
+ELEMENT TYPE BREAKDOWN: {types_text}
+KNOWN ELEMENTS: {ids_text}
+MOST REFERENCED ELEMENTS: {most_referenced_text}
+
+NOTE: This is a parent summary of a UML/XMI model split by packagedElement while preserving raw XML and UML relations.
+--- XMI DOCUMENT SUMMARY ---"""
+
+    results.append(
+        {
+            "filename": f"{filepath.stem}_PARENT_SUMMARY.xmichunk",
+            "text": parent_summary,
+            "payloadextra": {
+                "doctype": "xmi:parentsummary",
+                "componentid": None,
+                "componentkind": root_info["xmitype"],
+                "componentname": root_info["name"],
+                "targetnamespace": root.attrib.get("targetNamespace", ""),
+                "dependson": [],
+                "dependsonlabeled": [],
+                "referencedby": [],
+                "schemalinks": {},
+            },
         }
-    })
-    
-    # Chunks pour chaque élément
-    element_ids = [e["xmi_id"] or e["name"] for e in packaged_elements]
-    
-    for i, elem in enumerate(packaged_elements):
+    )
+
+    element_ids = [e["xmiid"] or e["name"] for e in packagedelements]
+
+    for i, elem in enumerate(packagedelements):
         previous_elem = element_ids[i - 1] if i > 0 else None
         next_elem = element_ids[i + 1] if i < len(element_ids) - 1 else None
-        
-        elem_id = elem["xmi_id"] or elem["name"]
-        referenced_by = reverse_refs.get(elem_id, []) + reverse_refs.get(elem["name"], [])
-        referenced_by = list(dict.fromkeys(referenced_by))  # Déduplique
-        
-        deps_text = ", ".join(elem["depends_on_labeled"][:25]) if elem["depends_on_labeled"] else "none"
+
+        elem_id = elem["xmiid"] or elem["name"]
+
+        referenced_by = reverse_refs.get(elem["xmiid"], []) + reverse_refs.get(
+            elem["name"], []
+        )
+        referenced_by = list(dict.fromkeys(referenced_by))
+
+        deps_text = (
+            ", ".join(elem["dependsonlabeled"][:25])
+            if elem["dependsonlabeled"]
+            else "none"
+        )
         refs_text = ", ".join(referenced_by[:25]) if referenced_by else "none"
-        
-        header = (
-            "[XMI_ELEMENT_CONTEXT]\n"
-            f"SOURCE_DOCUMENT: {filepath.name}\n"
-            f"XMI_ID: {elem['xmi_id'] or 'none'}\n"
-            f"XMI_TYPE: {elem['xmi_type']}\n"
-            f"ELEMENT_NAME: {elem['name']}\n"
-            f"ELEMENT_INDEX: {i + 1}/{len(packaged_elements)}\n"
-            f"PREVIOUS_ELEMENT: {previous_elem or 'none'}\n"
-            f"NEXT_ELEMENT: {next_elem or 'none'}\n"
-            f"DEPENDS_ON_LABELED: {deps_text}\n"
-            f"REFERENCED_BY: {refs_text}\n"
-            "[/XMI_ELEMENT_CONTEXT]\n\n"
-        )
-        
-        footer = (
-            "\n\n[XMI_ELEMENT_RELATIONS]\n"
-            f"SOURCE_DOCUMENT: {filepath.name}\n"
-            f"XMI_ID: {elem['xmi_id'] or 'none'}\n"
-            f"XMI_TYPE: {elem['xmi_type']}\n"
-            f"DEPENDS_ON_LABELED: {deps_text}\n"
-            f"REFERENCED_BY: {refs_text}\n"
-            "NOTE: This chunk preserves raw XMI/UML element plus extracted model relations.\n"
-            "[/XMI_ELEMENT_RELATIONS]"
-        )
-        
+
+        header = f"""--- XMI ELEMENT CONTEXT ---
+SOURCE DOCUMENT: {filepath.name}
+XMI ID: {elem["xmiid"] or "none"}
+XMI TYPE: {elem["xmitype"]}
+ELEMENT NAME: {elem["name"]}
+ELEMENT INDEX: {i+1}/{len(packagedelements)}
+PREVIOUS ELEMENT: {previous_elem or "none"}
+NEXT ELEMENT: {next_elem or "none"}
+DEPENDS ON (LABELED): {deps_text}
+REFERENCED BY: {refs_text}
+--- XMI ELEMENT CONTEXT ---
+
+"""
+
+        footer = f"""
+
+--- XMI ELEMENT RELATIONS ---
+SOURCE DOCUMENT: {filepath.name}
+XMI ID: {elem["xmiid"] or "none"}
+XMI TYPE: {elem["xmitype"]}
+DEPENDS ON (LABELED): {deps_text}
+REFERENCED BY: {refs_text}
+
+NOTE: This chunk preserves raw XMI/UML element plus extracted model relations.
+--- XMI ELEMENT RELATIONS ---"""
+
         final_text = header + elem["xml"] + footer
-        
+
         if len(final_text) > XML_MAX_CHUNK_CHARS:
-            abstract = (
-                "[XMI_ELEMENT_ABSTRACT]\n"
-                f"XMI_ID: {elem['xmi_id'] or 'none'}\n"
-                f"XMI_TYPE: {elem['xmi_type']}\n"
-                f"ELEMENT_NAME: {elem['name']}\n"
-                f"DEPENDENCIES: {deps_text}\n"
-                "[/XMI_ELEMENT_ABSTRACT]\n\n"
-            )
+            abstract = f"""--- XMI ELEMENT ABSTRACT ---
+XMI ID: {elem["xmiid"] or "none"}
+XMI TYPE: {elem["xmitype"]}
+ELEMENT NAME: {elem["name"]}
+DEPENDENCIES: {deps_text}
+--- XMI ELEMENT ABSTRACT ---
+
+"""
             final_text = header + abstract + elem["xml"][:90000] + footer
-        
-        safe_type = re.sub(r"[^A-Za-z0-9_.-]+", "_", elem["xmi_type"])
-        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", elem["name"])
-        
-        results.append({
-            "filename": f"{filepath.stem}__{safe_type}__{safe_name}.xmichunk",
-            "text": final_text,
-            "payload_extra": {
-                "doc_type": "xmi_packaged_element",
-                "component_id": elem["xmi_id"],
-                "component_kind": elem["xmi_type"],
-                "component_name": elem["name"],
-                "target_namespace": None,
-                "depends_on": elem["depends_on"],
-                "depends_on_labeled": elem["depends_on_labeled"],
-                "referenced_by": referenced_by,
-                "schema_links": {},
+
+        safe_type = re.sub(r"[^A-Za-z0-9._-]", "", elem["xmitype"])
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "", elem["name"])
+
+        results.append(
+            {
+                "filename": f"{filepath.stem}_{safe_type}_{safe_name}.xmichunk",
+                "text": final_text,
+                "payloadextra": {
+                    "doctype": "xmi:packagedelement",
+                    "componentid": elem["xmiid"],
+                    "componentkind": elem["xmitype"],
+                    "componentname": elem["name"],
+                    "targetnamespace": None,
+                    "dependson": elem["dependson"],
+                    "dependsonlabeled": elem["dependsonlabeled"],
+                    "referencedby": referenced_by,
+                    "schemalinks": {},
+                },
             }
-        })
-    
+        )
+
     return results
 
 
-def split_large_xml_semantically(filepath: Path, xml_content: str) -> list[dict[str, Any]]:
-    """Version améliorée qui détecte XSD vs XMI vs XML instance"""
+def split_large_xml_semantically(
+    filepath: Path, xml_content: str
+) -> list[dict[str, Any]]:
+    """Version améliorée qui détecte XSD vs XMI vs XML instance."""
     optimized_full = optimize_xml_preserving_standards(xml_content)
 
     if len(xml_content) < XML_SPLIT_THRESHOLD:
-        return [{
-            "filename": filepath.name,
-            "text": optimized_full,
-            "payload_extra": {
-                "doc_type": "xml_full",
-                "component_id": None,
-                "component_kind": None,
-                "component_name": None,
-                "target_namespace": None,
-                "depends_on": [],
-                "depends_on_labeled": [],
-                "referenced_by": [],
-                "schema_links": {},
+        return [
+            {
+                "filename": filepath.name,
+                "text": optimized_full,
+                "payloadextra": {
+                    "doctype": "xml:full",
+                    "componentid": None,
+                    "componentkind": None,
+                    "componentname": None,
+                    "targetnamespace": None,
+                    "dependson": [],
+                    "dependsonlabeled": [],
+                    "referencedby": [],
+                    "schemalinks": {},
+                },
             }
-        }]
+        ]
 
     try:
         root = ET.fromstring(xml_content)
     except Exception:
-        return [{
-            "filename": filepath.name,
-            "text": optimized_full,
-            "payload_extra": {
-                "doc_type": "xml_full",
-                "component_id": None,
-                "component_kind": None,
-                "component_name": None,
-                "target_namespace": None,
-                "depends_on": [],
-                "depends_on_labeled": [],
-                "referenced_by": [],
-                "schema_links": {},
-            }
-        }]
-
-    # Détecte le type de XML
-    xml_type = detect_xml_type(root)
-    
-    if xml_type == "xmi":
-        # C'est du XMI/UML → découpe par packagedElement
-        xmi_chunks = split_xmi_by_packaged_elements(filepath, root)
-        
-        if not xmi_chunks:
-            # Pas assez d'éléments → retourne le fichier entier
-            return [{
+        return [
+            {
                 "filename": filepath.name,
                 "text": optimized_full,
-                "payload_extra": {
-                    "doc_type": "xmi_full",
-                    "component_id": None,
-                    "component_kind": "XMI",
-                    "component_name": filepath.stem,
-                    "target_namespace": None,
-                    "depends_on": [],
-                    "depends_on_labeled": [],
-                    "referenced_by": [],
-                    "schema_links": {},
+                "payloadextra": {
+                    "doctype": "xml:full",
+                    "componentid": None,
+                    "componentkind": None,
+                    "componentname": None,
+                    "targetnamespace": None,
+                    "dependson": [],
+                    "dependsonlabeled": [],
+                    "referencedby": [],
+                    "schemalinks": {},
+                },
+            }
+        ]
+
+    xml_type = detect_xml_type(root)
+
+    if xml_type == "xmi":
+        xmi_chunks = split_xmi_by_packagedelements(filepath, root)
+        if not xmi_chunks:
+            return [
+                {
+                    "filename": filepath.name,
+                    "text": optimized_full,
+                    "payloadextra": {
+                        "doctype": "xmi:full",
+                        "componentid": None,
+                        "componentkind": "XMI",
+                        "componentname": filepath.stem,
+                        "targetnamespace": None,
+                        "dependson": [],
+                        "dependsonlabeled": [],
+                        "referencedby": [],
+                        "schemalinks": {},
+                    },
                 }
-            }]
-        
+            ]
         return xmi_chunks
-    
+
     elif xml_type == "xsd":
-        # C'est un schéma XSD → découpe par composants
         registry, schema_links = build_component_registry_xmlschema(filepath)
 
         if not registry:
             registry = build_component_registry_etree(root, filepath)
-            schema_links = resolve_local_schema_links(filepath, extract_schema_link_directives(root))
+            schema_links = resolve_local_schema_links(
+                filepath, extract_schema_link_directives(root)
+            )
 
         if not registry:
-            # Pas de composants trouvés → retourne le fichier entier
-            return [{
-                "filename": filepath.name,
-                "text": optimized_full,
-                "payload_extra": {
-                    "doc_type": "xml_full",
-                    "component_id": None,
-                    "component_kind": None,
-                    "component_name": None,
-                    "target_namespace": root.attrib.get("targetNamespace"),
-                    "depends_on": [],
-                    "depends_on_labeled": [],
-                    "referenced_by": [],
-                    "schema_links": schema_links,
+            return [
+                {
+                    "filename": filepath.name,
+                    "text": optimized_full,
+                    "payloadextra": {
+                        "doctype": "xml:full",
+                        "componentid": None,
+                        "componentkind": None,
+                        "componentname": None,
+                        "targetnamespace": root.attrib.get("targetNamespace", ""),
+                        "dependson": [],
+                        "dependsonlabeled": [],
+                        "referencedby": [],
+                        "schemalinks": schema_links,
+                    },
                 }
-            }]
+            ]
 
-        # Découpe par composants XSD
         reverse_refs = build_reverse_references(registry)
-        chunk_ids = [item["component_id"] for item in registry]
+        chunk_ids = [item["componentid"] for item in registry]
 
-        results: list[dict[str, Any]] = []
+        results = []
 
         parent_summary = build_parent_xml_summary(
             filepath=filepath,
-            root_tag=local_name(root.tag),
+            root_tag=localname(root.tag),
             registry=registry,
             reverse_refs=reverse_refs,
             schema_links=schema_links,
         )
 
-        results.append({
-            "filename": f"{filepath.stem}__PARENT_SUMMARY.xmlchunk",
-            "text": parent_summary,
-            "payload_extra": {
-                "doc_type": "xml_parent_summary",
-                "component_id": None,
-                "component_kind": None,
-                "component_name": None,
-                "target_namespace": root.attrib.get("targetNamespace"),
-                "depends_on": [],
-                "depends_on_labeled": [],
-                "referenced_by": [],
-                "schema_links": schema_links,
+        results.append(
+            {
+                "filename": f"{filepath.stem}_PARENT_SUMMARY.xmlchunk",
+                "text": parent_summary,
+                "payloadextra": {
+                    "doctype": "xml:parentsummary",
+                    "componentid": None,
+                    "componentkind": None,
+                    "componentname": None,
+                    "targetnamespace": root.attrib.get("targetNamespace", ""),
+                    "dependson": [],
+                    "dependsonlabeled": [],
+                    "referencedby": [],
+                    "schemalinks": schema_links,
+                },
             }
-        })
+        )
 
         for i, item in enumerate(registry):
             previous_chunk = chunk_ids[i - 1] if i > 0 else None
             next_chunk = chunk_ids[i + 1] if i < len(chunk_ids) - 1 else None
-            referenced_by = reverse_refs.get(item["component_name"], []) + reverse_refs.get(item["component_id"], [])
+
+            referenced_by = reverse_refs.get(item["componentname"], []) + reverse_refs.get(
+                item["componentid"], []
+            )
             seen = set()
             referenced_by = [x for x in referenced_by if not (x in seen or seen.add(x))]
 
@@ -1199,44 +1274,47 @@ def split_large_xml_semantically(filepath: Path, xml_content: str) -> list[dict[
                 schema_links=schema_links,
             )
 
-            safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", item["component_name"])
-            safe_kind = re.sub(r"[^A-Za-z0-9_.-]+", "_", item["component_kind"])
+            safe_name = re.sub(r"[^A-Za-z0-9._-]", "", item["componentname"])
+            safe_kind = re.sub(r"[^A-Za-z0-9._-]", "", item["componentkind"])
 
-            results.append({
-                "filename": f"{filepath.stem}__{safe_kind}__{safe_name}.xmlchunk",
-                "text": chunk_text,
-                "payload_extra": {
-                    "doc_type": "xml_component_chunk",
-                    "component_id": item["component_id"],
-                    "component_kind": item["component_kind"],
-                    "component_name": item["component_name"],
-                    "target_namespace": item["target_namespace"],
-                    "depends_on": item["depends_on"],
-                    "depends_on_labeled": item["depends_on_labeled"],
-                    "referenced_by": referenced_by,
-                    "schema_links": schema_links,
+            results.append(
+                {
+                    "filename": f"{filepath.stem}_{safe_kind}_{safe_name}.xmlchunk",
+                    "text": chunk_text,
+                    "payloadextra": {
+                        "doctype": "xml:componentchunk",
+                        "componentid": item["componentid"],
+                        "componentkind": item["componentkind"],
+                        "componentname": item["componentname"],
+                        "targetnamespace": item["targetnamespace"],
+                        "dependson": item["dependson"],
+                        "dependsonlabeled": item["dependsonlabeled"],
+                        "referencedby": referenced_by,
+                        "schemalinks": schema_links,
+                    },
                 }
-            })
+            )
 
         return results
-    
+
     else:
-        # C'est un document XML d'instance → retourne entier pour l'instant
-        return [{
-            "filename": filepath.name,
-            "text": optimized_full,
-            "payload_extra": {
-                "doc_type": "xml_instance_full",
-                "component_id": None,
-                "component_kind": None,
-                "component_name": None,
-                "target_namespace": root.attrib.get("targetNamespace"),
-                "depends_on": [],
-                "depends_on_labeled": [],
-                "referenced_by": [],
-                "schema_links": {},
+        return [
+            {
+                "filename": filepath.name,
+                "text": optimized_full,
+                "payloadextra": {
+                    "doctype": "xml:instance:full",
+                    "componentid": None,
+                    "componentkind": None,
+                    "componentname": None,
+                    "targetnamespace": root.attrib.get("targetNamespace", ""),
+                    "dependson": [],
+                    "dependsonlabeled": [],
+                    "referencedby": [],
+                    "schemalinks": {},
+                },
             }
-        }]
+        ]
 
 
 def optimize_document_content(filepath: Path, text: str) -> tuple[str, bool]:
@@ -1252,11 +1330,11 @@ def optimize_document_content(filepath: Path, text: str) -> tuple[str, bool]:
             optimized = optimize_xml_preserving_standards(text)
             return optimized, optimized != text
 
-        if ext in {".ttl", ".rdf", ".owl", ".n3", ".nt", ".trig"}:
-            optimized = optimize_rdf_like_text(text)
+        if ext in (".ttl", ".rdf", ".owl", ".n3", ".nt", ".trig"):
+            optimized = optimize_rdflike_text(text)
             return optimized, optimized != text
 
-        if ext in {".yaml", ".yml"}:
+        if ext in (".yaml", ".yml"):
             optimized = optimize_yaml_content(text)
             return optimized, optimized != text
 
@@ -1264,21 +1342,22 @@ def optimize_document_content(filepath: Path, text: str) -> tuple[str, bool]:
             optimized = optimize_csv_content(text)
             return optimized, optimized != text
 
-        if ext in {".html", ".htm", ".xhtml"}:
+        if ext in (".html", ".htm", ".xhtml"):
             optimized = optimize_html_content(text)
             return optimized, optimized != text
 
-        if ext in {".md", ".markdown", ".rst", ".adoc", ".txt"}:
+        if ext in (".md", ".markdown", ".rst", ".adoc", ".txt"):
             optimized = optimize_markdown_content(text)
             return optimized, optimized != text
 
         optimized = optimize_generic_text(text)
         if len(optimized) < len(text) * 0.95:
             return optimized, True
+
         return text, False
 
     except Exception as e:
-        print(f"  ⚠ Optimization failed for {filepath.name}: {e}")
+        print(f"[!] Optimization failed for {filepath.name}: {e}")
         return text, False
 
 
@@ -1287,14 +1366,13 @@ def setup_collection(capabilities: dict[str, Any]) -> bool:
     collection_exists = any(c.name == COLLECTION for c in collections)
 
     if collection_exists:
-        print(f"⚠ Collection '{COLLECTION}' already exists.")
-        choice = input("  Delete and recreate? (y/n): ").strip().lower()
-
+        print(f"[!] Collection '{COLLECTION}' already exists.")
+        choice = input("Delete and recreate? (y/n): ").strip().lower()
         if choice == "y":
             client.delete_collection(collection_name=COLLECTION)
-            print(f"✓ Deleted collection '{COLLECTION}'")
+            print(f"[✓] Deleted collection '{COLLECTION}'")
         else:
-            print(f"✓ Using existing collection '{COLLECTION}'")
+            print(f"[~] Using existing collection '{COLLECTION}'")
             return False
 
     if capabilities["has_dense"] and capabilities["has_sparse"]:
@@ -1304,15 +1382,15 @@ def setup_collection(capabilities: dict[str, Any]) -> bool:
                 DENSE_VECTOR_NAME: VectorParams(
                     size=capabilities["dense_dim"],
                     distance=Distance.COSINE,
-                )
+                ),
             },
             sparse_vectors_config={
-                SPARSE_VECTOR_NAME: SparseVectorParams()
+                SPARSE_VECTOR_NAME: SparseVectorParams(),
             },
         )
         print(
-            f"✓ Created hybrid collection '{COLLECTION}' "
-            f"(dense={capabilities['dense_dim']}, sparse=yes)"
+            f"[✓] Created hybrid collection '{COLLECTION}' "
+            f"(dense:{capabilities['dense_dim']}, sparse:yes)"
         )
 
     elif capabilities["has_dense"]:
@@ -1324,8 +1402,8 @@ def setup_collection(capabilities: dict[str, Any]) -> bool:
             ),
         )
         print(
-            f"✓ Created dense-only collection '{COLLECTION}' "
-            f"(dense={capabilities['dense_dim']})"
+            f"[✓] Created dense-only collection '{COLLECTION}' "
+            f"(dense:{capabilities['dense_dim']})"
         )
 
     elif capabilities["has_sparse"]:
@@ -1333,10 +1411,10 @@ def setup_collection(capabilities: dict[str, Any]) -> bool:
             collection_name=COLLECTION,
             vectors_config={},
             sparse_vectors_config={
-                SPARSE_VECTOR_NAME: SparseVectorParams()
+                SPARSE_VECTOR_NAME: SparseVectorParams(),
             },
         )
-        print(f"✓ Created sparse-only collection '{COLLECTION}'")
+        print(f"[✓] Created sparse-only collection '{COLLECTION}'")
 
     else:
         raise ValueError("Model has neither dense nor sparse capability")
@@ -1353,10 +1431,10 @@ def get_existing_ids():
             with_vectors=False,
         )
         existing_ids = {point.id for point in result[0]}
-        print(f"  → Found {len(existing_ids)} existing documents")
+        print(f"[~] Found {len(existing_ids)} existing documents")
         return existing_ids
     except Exception as e:
-        print(f"  ✗ Failed to retrieve existing IDs: {e}")
+        print(f"[!] Failed to retrieve existing IDs: {e}")
         return set()
 
 
@@ -1366,7 +1444,7 @@ def generate_stable_id(text: str) -> int:
 
 
 def generate_component_stable_id(filename: str, component_id: str | None, text: str) -> int:
-    base = f"{filename}::{component_id}" if component_id else f"{filename}::{text[:1000]}"
+    base = f"{filename}:{component_id}" if component_id else f"{filename}:{text[:1000]}"
     hash_bytes = sha256(base.encode("utf-8")).digest()
     return int.from_bytes(hash_bytes[:8], byteorder="big") & 0x7FFFFFFFFFFFFFFF
 
@@ -1378,7 +1456,7 @@ def _lexical_to_sparse_vector(lexical_weights: dict[Any, Any]) -> SparseVector:
 
 
 def encode_batch(texts: list[str], capabilities: dict[str, Any]) -> list[dict[str, Any]]:
-    outputs: list[dict[str, Any]] = []
+    outputs = []
 
     if capabilities["has_dense"] and capabilities["has_sparse"]:
         result = model.encode(
@@ -1392,19 +1470,22 @@ def encode_batch(texts: list[str], capabilities: dict[str, Any]) -> list[dict[st
         lexical_weights = result.get("lexical_weights", [])
 
         for i in range(len(texts)):
-            item: dict[str, Any] = {}
+            item = {}
             if i < len(dense_vecs):
                 dense = dense_vecs[i]
                 item["dense"] = dense.tolist() if hasattr(dense, "tolist") else list(dense)
             if i < len(lexical_weights):
                 item["sparse"] = _lexical_to_sparse_vector(lexical_weights[i])
             outputs.append(item)
+
         return outputs
 
     if capabilities["has_dense"]:
         dense_vecs = model.encode(texts)
         for dense in dense_vecs:
-            outputs.append({"dense": dense.tolist() if hasattr(dense, "tolist") else list(dense)})
+            outputs.append(
+                {"dense": dense.tolist() if hasattr(dense, "tolist") else list(dense)}
+            )
         return outputs
 
     if capabilities["has_sparse"]:
@@ -1422,27 +1503,30 @@ def encode_batch(texts: list[str], capabilities: dict[str, Any]) -> list[dict[st
     raise ValueError("No supported vector output available from model")
 
 
-def build_point(
-    doc_id: int,
+def buildpoint(
+    docid: int,
     text: str,
     filename: str,
-    encoding_used: str,
+    encodingused: str,
     vectors: dict[str, Any],
     capabilities: dict[str, Any],
-    payload_extra: dict[str, Any] | None = None,
+    payloadextra: dict[str, Any] | None = None,
 ) -> PointStruct:
+    # ✅ Extrait le vocabulaire du filename
+    vocabulary = _extract_vocabulary_from_filename(filename)
+    
     payload = {
         "text": text,
         "filename": filename,
-        "encoding": encoding_used,
+        "encoding": encodingused,
+        "vocabulary": vocabulary,  # ✅ Stocke explicitement le vocabulaire
     }
-
-    if payload_extra:
-        payload.update(payload_extra)
+    if payloadextra:
+        payload.update(payloadextra)
 
     if capabilities["has_dense"] and capabilities["has_sparse"]:
         return PointStruct(
-            id=doc_id,
+            id=docid,
             vector={
                 DENSE_VECTOR_NAME: vectors["dense"],
                 SPARSE_VECTOR_NAME: vectors["sparse"],
@@ -1452,14 +1536,14 @@ def build_point(
 
     if capabilities["has_dense"]:
         return PointStruct(
-            id=doc_id,
+            id=docid,
             vector=vectors["dense"],
             payload=payload,
         )
 
     if capabilities["has_sparse"]:
         return PointStruct(
-            id=doc_id,
+            id=docid,
             vector={SPARSE_VECTOR_NAME: vectors["sparse"]},
             payload=payload,
         )
@@ -1476,167 +1560,174 @@ def flush_batch(
     encoded_vectors = encode_batch(texts, capabilities)
 
     for item, vectors in zip(batch_docs, encoded_vectors):
-        point = build_point(
-            doc_id=item["doc_id"],
+        point = buildpoint(
+            docid=item["docid"],
             text=item["text"],
             filename=item["filename"],
-            encoding_used=item["encoding"],
+            encodingused=item["encoding"],
             vectors=vectors,
             capabilities=capabilities,
-            payload_extra=item.get("payload_extra"),
+            payloadextra=item.get("payloadextra"),
         )
         points.append(point)
-        print(f"✓ Loaded: {item['filename']} [{item['encoding']}]")
+        print(f"[~] Loaded {item['filename']} ({item['encoding']})")
 
     client.upsert(collection_name=COLLECTION, points=points)
     uploaded = len(points)
-    print(f"  → Uploaded batch of {uploaded}")
+    print(f"[✓] Uploaded batch of {uploaded}")
+
     points.clear()
     batch_docs.clear()
+
     return uploaded
 
 
 def index_documents():
-    print("\n🔍 Detecting model capabilities...")
+    print("Detecting model capabilities...")
     capabilities = cf.MODEL_CAPABILITIES
 
     is_fresh = setup_collection(capabilities)
     existing_ids = set() if is_fresh else get_existing_ids()
 
     docs_path = Path(__file__).parent / "documents"
+
     total_indexed = 0
     total_skipped = 0
-    total_non_text = 0
+    total_nontext = 0
     total_optimized = 0
     total_xml_chunks = 0
 
-    batch_docs: list[dict[str, Any]] = []
-    points: list[PointStruct] = []
+    batch_docs = []
+    points = []
 
     if not docs_path.exists():
-        print(f"✗ Directory not found: {docs_path}")
+        print(f"[!] Directory not found: {docs_path}")
         return
 
-    print(f"\n📂 Scanning documents in: {docs_path}")
+    print(f"[~] Scanning documents in {docs_path}")
 
-    def push_doc(filename: str, content: str, encoding_used: str, payload_extra: dict[str, Any] | None = None):
+    def pushdoc(
+        filename: str,
+        content: str,
+        encodingused: str,
+        payloadextra: dict[str, Any] | None = None,
+    ):
         nonlocal total_skipped
 
-        component_id = payload_extra.get("component_id") if payload_extra else None
-        doc_id = generate_component_stable_id(filename, component_id, content)
+        component_id = payloadextra.get("componentid") if payloadextra else None
+        docid = generate_component_stable_id(filename, component_id, content)
 
-        if not is_fresh and doc_id in existing_ids:
-            print(f"⊘ Skipped (duplicate): {filename}")
+        if not is_fresh and docid in existing_ids:
+            print(f"[~] Skipped duplicate: {filename}")
             total_skipped += 1
             return
 
-        batch_docs.append({
-            "filename": filename,
-            "text": content,
-            "encoding": encoding_used,
-            "doc_id": doc_id,
-            "payload_extra": payload_extra or {},
-        })
+        batch_docs.append(
+            {
+                "filename": filename,
+                "text": content,
+                "encoding": encodingused,
+                "docid": docid,
+                "payloadextra": payloadextra or {},
+            }
+        )
 
     for filepath in docs_path.iterdir():
         if not filepath.is_file():
             continue
 
         try:
-            text, encoding_used = read_text_document(filepath)
+            text, encodingused = read_text_document(filepath)
 
-            if filepath.suffix.lower() == ".xml" and len(text) >= XML_SPLIT_THRESHOLD:
+            if filepath.suffix.lower() == ".xml" and len(text) > XML_SPLIT_THRESHOLD:
                 chunks = split_large_xml_semantically(filepath, text)
-                print(f"  ✂ Split XML {filepath.name} into {len(chunks)} chunks")
+                print(f"[~] Split XML {filepath.name} into {len(chunks)} chunks")
                 total_xml_chunks += max(0, len(chunks) - 1)
 
-                # Ajoute tous les chunks au batch
                 for chunk in chunks:
-                    optimized_chunk, was_optimized = optimize_document_content(Path(chunk["filename"]), chunk["text"])
+                    optimized_chunk, was_optimized = optimize_document_content(
+                        Path(chunk["filename"]), chunk["text"]
+                    )
                     if was_optimized:
                         total_optimized += 1
 
-                    push_doc(
+                    pushdoc(
                         filename=chunk["filename"],
                         content=optimized_chunk,
-                        encoding_used=encoding_used,
-                        payload_extra=chunk["payload_extra"],
+                        encodingused=encodingused,
+                        payloadextra=chunk["payloadextra"],
                     )
 
-                # CORRECTION : Flush immédiatement après avoir ajouté tous les chunks de ce fichier
-                # pour garantir qu'ils sont tous uploadés ensemble
-                if batch_docs:
+                if len(batch_docs) >= BATCH_SIZE:
                     try:
                         total_indexed += flush_batch(batch_docs, points, capabilities)
                     except Exception as e:
-                        print(f"  ✗ Batch upload failed: {e}")
+                        print(f"[!] Batch upload failed: {e}")
                         batch_docs.clear()
                         points.clear()
-                
+
                 continue
 
             optimized_text, was_optimized = optimize_document_content(filepath, text)
 
             if was_optimized:
                 total_optimized += 1
-                original_len = len(text)
+                origin_len = len(text)
                 optimized_len = len(optimized_text)
-                reduction = (1 - optimized_len / original_len) * 100 if original_len else 0
+                reduction = ((1 - (optimized_len / origin_len)) * 100) if origin_len else 0
                 print(
-                    f"  ⚡ Optimized {filepath.name}: "
-                    f"{original_len} → {optimized_len} chars ({reduction:.1f}% reduction)"
+                    f"[~] Optimized {filepath.name}: "
+                    f"{origin_len} → {optimized_len} chars "
+                    f"({reduction:.1f}% reduction)"
                 )
 
-            push_doc(
+            pushdoc(
                 filename=filepath.name,
                 content=optimized_text,
-                encoding_used=encoding_used,
-                payload_extra={
-                    "doc_type": "regular_document",
-                    "component_id": None,
-                    "component_kind": None,
-                    "component_name": None,
-                    "target_namespace": None,
-                    "depends_on": [],
-                    "depends_on_labeled": [],
-                    "referenced_by": [],
-                    "schema_links": {},
+                encodingused=encodingused,
+                payloadextra={
+                    "doctype": "regulardocument",
+                    "componentid": None,
+                    "componentkind": None,
+                    "componentname": None,
+                    "targetnamespace": None,
+                    "dependson": [],
+                    "dependsonlabeled": [],
+                    "referencedby": [],
+                    "schemalinks": {},
                 },
             )
 
-            # Pour les fichiers non-XML, on flush seulement si le batch est plein
             if len(batch_docs) >= BATCH_SIZE:
                 try:
                     total_indexed += flush_batch(batch_docs, points, capabilities)
                 except Exception as e:
-                    print(f"  ✗ Batch upload failed: {e}")
+                    print(f"[!] Batch upload failed: {e}")
                     batch_docs.clear()
                     points.clear()
 
         except ValueError as e:
-            print(f"⊘ Skipped non-text file {filepath.name}: {e}")
-            total_non_text += 1
-
+            print(f"[!] Skipped non-text file {filepath.name}: {e}")
+            total_nontext += 1
         except Exception as e:
-            print(f"✗ Failed to read {filepath.name}: {e}")
+            print(f"[!] Failed to read {filepath.name}: {e}")
 
-    # Flush final pour les documents restants
     if batch_docs:
         try:
             total_indexed += flush_batch(batch_docs, points, capabilities)
         except Exception as e:
-            print(f"  ✗ Final batch upload failed: {e}")
+            print(f"[!] Final batch upload failed: {e}")
 
-    print(f"\n{'=' * 50}")
-    print("✓ Indexing complete")
-    print(f"  • Documents indexed: {total_indexed}")
-    print(f"  • Documents optimized: {total_optimized}")
-    print(f"  • XML/XMI semantic chunks created: {total_xml_chunks}")
+    print("=" * 50)
+    print("Indexing complete!")
+    print(f"[✓] Documents indexed: {total_indexed}")
+    print(f"[✓] Documents optimized: {total_optimized}")
+    print(f"[✓] XML/XMI semantic chunks created: {total_xml_chunks}")
     if total_skipped > 0:
-        print(f"  • Documents skipped (duplicates): {total_skipped}")
-    if total_non_text > 0:
-        print(f"  • Files skipped (non-text): {total_non_text}")
-    print(f"{'=' * 50}")
+        print(f"[~] Documents skipped (duplicates): {total_skipped}")
+    if total_nontext > 0:
+        print(f"[!] Files skipped (non-text): {total_nontext}")
+    print("=" * 50)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,11 @@ from qdrant_client.models import (
     Prefetch,
     FusionQuery,
     Fusion,
+    Filter,
+    FieldCondition,
+    MatchAny,
 )
+
 try:
     from .load_documents import config as cf
 except ImportError:
@@ -18,13 +22,11 @@ COLLECTION = cf.COLLECTION
 DENSE_VECTOR_NAME = "dense"
 SPARSE_VECTOR_NAME = "sparse"
 
-
 SEARCH_LIMIT: int = int(
     getattr(cf, "config", {}).get("search", {}).get("limit", 3)
     if hasattr(cf, "config")
     else 3
 )
-
 
 Vocabulary = Literal[
     "CAV",
@@ -35,13 +37,72 @@ Vocabulary = Literal[
     "CPOV",
     "CPSV",
     "CPV",
-    "OSLO_Observaties_en_Metingen",
-    "OSLO_Organisatie",
-    "OSLO_Persoon",
-    "OSLO_Adres",
-    "OSLO_Gebouw",
+    "SDG-AC",
+    "SDG-ACM",
+    "SDG-AERP",
+    "SDG-AL",
+    "SDG-AP",
+    "SDG-AV",
+    "SDG-BS",
+    "SDG-BUDG",
+    "SDG-CATAL",
+    "SDG-CDBRRC",
+    "SDG-CMC",
+    "SDG-CMM",
+    "SDG-COLL",
+    "SDG-DAE",
+    "SDG-DECP",
+    "SDG-DELIB",
+    "SDG-DISAI",
+    "SDG-DOCP",
+    "SDG-DONNA",
+    "SDG-DYNA",
+    "SDG-EA",
+    "SDG-ENSPAY",
+    "SDG-EQUIP",
+    "SDG-FONTEA",
+    "SDG-FRI",
+    "SDG-HR",
+    "SDG-IDLL",
+    "SDG-IDT",
+    "SDG-IDYN",
+    "SDG-IR",
+    "SDG-IRA",
+    "SDG-ISPN",
+    "SDG-ISTAT",
+    "SDG-IT",
+    "SDG-LC",
+    "SDG-LDP",
+    "SDG-LSTAT",
+    "SDG-MCOL",
+    "SDG-OA",
+    "SDG-OINS",
+    "SDG-ONP",
+    "SDG-PASSN",
+    "SDG-PEI",
+    "SDG-PMCOLL",
+    "SDG-PNN",
+    "SDG-PROG",
+    "SDG-PTER",
+    "SDG-REA",
+    "SDG-SC",
+    "SDG-SCMS",
+    "SDG-SDIR",
+    "SDG-SECT",
+    "SDG-SEE",
+    "SDG-SEPE",
+    "SDG-SESE",
+    "SDG-SETE",
+    "SDG-SFDPA",
+    "SDG-SMN",
+    "SDG-SP",
+    "SDG-ST",
+    "SDG-SUBV",
+    "SDG-UP",
+    "SDG-VFERP",
+    "SDG-VFERPS",
+    "SDG-ZFE",
 ]
-
 
 VOCABULARIES: List[Vocabulary] = [
     "CAV",
@@ -52,23 +113,72 @@ VOCABULARIES: List[Vocabulary] = [
     "CPOV",
     "CPSV",
     "CPV",
-    "OSLO_Observaties_en_Metingen",
-    "OSLO_Organisatie",
-    "OSLO_Persoon",
-    "OSLO_Adres",
-    "OSLO_Gebouw",
+    "SDG-AC",
+    "SDG-ACM",
+    "SDG-AERP",
+    "SDG-AL",
+    "SDG-AP",
+    "SDG-AV",
+    "SDG-BS",
+    "SDG-BUDG",
+    "SDG-CATAL",
+    "SDG-CDBRRC",
+    "SDG-CMC",
+    "SDG-CMM",
+    "SDG-COLL",
+    "SDG-DAE",
+    "SDG-DECP",
+    "SDG-DELIB",
+    "SDG-DISAI",
+    "SDG-DOCP",
+    "SDG-DONNA",
+    "SDG-DYNA",
+    "SDG-EA",
+    "SDG-ENSPAY",
+    "SDG-EQUIP",
+    "SDG-FONTEA",
+    "SDG-FRI",
+    "SDG-HR",
+    "SDG-IDLL",
+    "SDG-IDT",
+    "SDG-IDYN",
+    "SDG-IR",
+    "SDG-IRA",
+    "SDG-ISPN",
+    "SDG-ISTAT",
+    "SDG-IT",
+    "SDG-LC",
+    "SDG-LDP",
+    "SDG-LSTAT",
+    "SDG-MCOL",
+    "SDG-OA",
+    "SDG-OINS",
+    "SDG-ONP",
+    "SDG-PASSN",
+    "SDG-PEI",
+    "SDG-PMCOLL",
+    "SDG-PNN",
+    "SDG-PROG",
+    "SDG-PTER",
+    "SDG-REA",
+    "SDG-SC",
+    "SDG-SCMS",
+    "SDG-SDIR",
+    "SDG-SECT",
+    "SDG-SEE",
+    "SDG-SEPE",
+    "SDG-SESE",
+    "SDG-SETE",
+    "SDG-SFDPA",
+    "SDG-SMN",
+    "SDG-SP",
+    "SDG-ST",
+    "SDG-SUBV",
+    "SDG-UP",
+    "SDG-VFERP",
+    "SDG-VFERPS",
+    "SDG-ZFE",
 ]
-
-
-def _extract_vocabulary_from_filename(filename: str) -> Optional[str]:
-    """
-    Heuristic: vocabulary is the prefix before the first underscore in the file name.
-    E.g. 'CPV_AP_SHACL_96.json' -> 'CPV'
-    """
-    if not filename:
-        return None
-    prefix = filename.split("_", 1)[0]
-    return prefix if prefix in VOCABULARIES else None
 
 
 def detect_model_capabilities(model) -> dict[str, Any]:
@@ -185,6 +295,9 @@ def retrieve_documents(
     - dense search if model is dense-only
     - sparse search if model is sparse-only
     - hybrid search (RRF fusion) if model supports both
+    
+    Filters by vocabulary using Qdrant's native filtering BEFORE vector search.
+    If vocabularies are specified and no results match, returns an empty list.
     """
     if limit is None:
         limit = SEARCH_LIMIT
@@ -193,6 +306,19 @@ def retrieve_documents(
         capabilities = cf.MODEL_CAPABILITIES
         query_vectors = encode_query(search_terms, capabilities)
 
+        # ✅ Crée un filtre Qdrant si vocabularies est spécifié
+        query_filter = None
+        if vocabularies:
+            query_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="vocabulary",
+                        match=MatchAny(any=list(vocabularies))
+                    )
+                ]
+            )
+
+        # Recherche hybride (dense + sparse)
         if "dense" in query_vectors and "sparse" in query_vectors:
             results = client.query_points(
                 collection_name=COLLECTION,
@@ -201,11 +327,13 @@ def retrieve_documents(
                         query=query_vectors["dense"],
                         using=DENSE_VECTOR_NAME,
                         limit=max(limit * 3, 10),
+                        filter=query_filter,  # ✅ Filtre AVANT la recherche
                     ),
                     Prefetch(
                         query=query_vectors["sparse"],
                         using=SPARSE_VECTOR_NAME,
                         limit=max(limit * 3, 10),
+                        filter=query_filter,  # ✅ Filtre AVANT la recherche
                     ),
                 ],
                 query=FusionQuery(fusion=Fusion.RRF),
@@ -213,50 +341,35 @@ def retrieve_documents(
                 with_payload=True,
             )
 
+        # Recherche dense uniquement
         elif "dense" in query_vectors:
             results = client.query_points(
                 collection_name=COLLECTION,
                 query=query_vectors["dense"],
                 limit=limit,
+                query_filter=query_filter,  # ✅ Filtre AVANT la recherche
                 with_payload=True,
             )
 
+        # Recherche sparse uniquement
         elif "sparse" in query_vectors:
             results = client.query_points(
                 collection_name=COLLECTION,
                 query=query_vectors["sparse"],
                 using=SPARSE_VECTOR_NAME,
                 limit=limit,
+                query_filter=query_filter,  # ✅ Filtre AVANT la recherche
                 with_payload=True,
             )
 
         else:
             raise ValueError("No query vectors generated")
 
-        raw_results: List[Tuple[str, str, float]] = [
+        # ✅ Retourne directement les résultats (déjà filtrés par Qdrant)
+        return [
             (r.payload["filename"], r.payload["text"], r.score)
             for r in results.points
         ]
-
-        if not vocabularies:
-            return raw_results
-
-        vocab_set = set(vocabularies)
-        filtered_results: List[Tuple[str, str, float]] = []
-
-        for filename, text, score in raw_results:
-            vocab = _extract_vocabulary_from_filename(filename)
-            if vocab is not None and vocab in vocab_set:
-                filtered_results.append((filename, text, score))
-
-        if not filtered_results:
-            print(
-                f"[retrieve_documents] No results after vocabulary filtering "
-                f"for {vocabularies}; falling back to unfiltered results."
-            )
-            return raw_results
-
-        return filtered_results
 
     except Exception as e:
         print(f"Error retrieving documents: {e}")
