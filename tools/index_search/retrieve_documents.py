@@ -6,6 +6,7 @@ from qdrant_client.models import (
     Filter,
     FieldCondition,
     MatchValue,
+    MatchAny,
 )
 
 try:
@@ -193,9 +194,20 @@ def encode_query(query_text: str, capabilities: dict[str, Any]) -> dict[str, Any
     raise ValueError("No supported vector output available from model")
 
 
-def _run_chunk_search(search_terms: str, raw_limit: int):
+def _run_chunk_search(search_terms: str, raw_limit: int, tags: list = None):
     capabilities = cf.MODEL_CAPABILITIES
     query_vectors = encode_query(search_terms, capabilities)
+
+    query_filter = None
+    if tags:
+        query_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="tags",
+                    match=MatchAny(any=tags)
+                )
+            ]
+        )
 
     dense_res = None
     sparse_res = None
@@ -204,6 +216,7 @@ def _run_chunk_search(search_terms: str, raw_limit: int):
         dense_res = client.query_points(
             collection_name=COLLECTION,
             query=query_vectors["dense"],
+            query_filter=query_filter,
             using=DENSE_VECTOR_NAME,
             limit=raw_limit,
             with_payload=True,
@@ -213,6 +226,7 @@ def _run_chunk_search(search_terms: str, raw_limit: int):
         sparse_res = client.query_points(
             collection_name=COLLECTION,
             query=query_vectors["sparse"],
+            query_filter=query_filter,
             using=SPARSE_VECTOR_NAME,
             limit=raw_limit,
             with_payload=True,
@@ -543,7 +557,8 @@ def retrieve_documents(
     search_terms: str,
     limit: int = 10,
     return_full_document: bool = True,
-) -> List[Tuple[str, str, float]]:
+    tags: list = None,
+) -> List[Tuple[str, str, float, list]]:
     if limit is None:
         limit = SEARCH_LIMIT
 
@@ -554,11 +569,19 @@ def retrieve_documents(
             limit * CANDIDATE_MULTIPLIER,
         )
 
-        results = _run_chunk_search(search_terms, raw_limit)
+        results = _run_chunk_search(search_terms, raw_limit, tags=tags)
         points = getattr(results, "points", [])
 
         if not points:
             return []
+
+        doc_tags_map = {}
+        for p in points:
+            payload = p.payload or {}
+            doc_id = str(payload.get("document_id") or payload.get("filename") or p.id)
+            if doc_id not in doc_tags_map:
+                t = payload.get("tags", [])
+                doc_tags_map[doc_id] = [t] if isinstance(t, str) else list(t)
 
         points = _limit_chunks_per_document(
             points,
@@ -592,8 +615,10 @@ def retrieve_documents(
 
         final_results: List[Tuple[str, str, float]] = []
         for doc in final_docs:
+            doc_id = doc["document_id"]
+            doc_tags = doc_tags_map.get(doc_id, [])
             final_results.append(
-                (doc["filename"], doc["text"], doc["rerank_score"])
+                (doc["filename"], doc["text"], doc["rerank_score"], doc_tags)
             )
 
         return final_results

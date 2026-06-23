@@ -4,9 +4,14 @@ import re
 import codecs
 import json
 import csv
+import os
 from io import StringIO
 from typing import Any
 import pymupdf4llm
+import base64
+
+from dotenv import load_dotenv
+from openai import OpenAI
 
 from qdrant_client.models import (
     Distance,
@@ -14,6 +19,7 @@ from qdrant_client.models import (
     PointStruct,
     SparseVectorParams,
     SparseVector,
+    PayloadSchemaType,
 )
 
 try:
@@ -21,10 +27,30 @@ try:
 except ImportError:
     import config as cf
 
+
+# ─── Chargement du .env à la racine du projet ───────────────────────────────
+_ROOT_ENV = Path(__file__).resolve().parent
+while _ROOT_ENV.parent != _ROOT_ENV:
+    if (_ROOT_ENV / ".env").exists():
+        break
+    _ROOT_ENV = _ROOT_ENV.parent
+load_dotenv(_ROOT_ENV / ".env")
+
+# ─── Client LLM (API OpenAI-compatible) ──────────────────────────────────
+_LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+_URL_API = os.getenv("URL_LLM_API", "")
+_llm_client = OpenAI(
+    base_url=_URL_API,
+    api_key=_LLM_API_KEY,
+)
+_LLM_MODEL = os.getenv("LLM_MODEL", "")
+_SUMMARY_MAX_INPUT_CHARS = 500_000
+
 client = cf.client
 model = cf.model
 COLLECTION = cf.COLLECTION
 BATCH_SIZE = cf.BATCH_SIZE
+
 
 XML_DECL_RE = re.compile(br'<\?xml[^>]+encoding\s*=\s*["\']([^"\']+)', re.IGNORECASE)
 TEXT_BOMS = (
@@ -52,11 +78,64 @@ CHUNK_OVERLAP = int(
     else 400
 )
 
+_SUMMARY_SYSTEM_PROMPT = (
+    "Tu es un assistant expert en résumé de documents techniques et réglementaires. "
+    "Produis un résumé factuel, neutre et très concis du document fourni. "
+    "Le résumé doit :\n"
+    "- Présenter l'objet principal du document en une phrase.\n"
+    "- Optionnellement lister 1 à 2 points clés.\n"
+    "- Ne rien inventer ni extrapoler au-delà du texte fourni.\n"
+    "- Être rédigé en français.\n"
+    "- Avoir une longueur totale comprise entre 200 et 500 caractères MAXIMUM."
+)
+
+
+# ─── Génération du résumé ────────────────────────────────────────────────────
+
+def generate_doc_summary(filename: str, full_text: str) -> str:
+    """
+    Appelle un LLM (via API OpenAI-compatible) pour produire un résumé du document.
+    Tronque à _SUMMARY_MAX_INPUT_CHARS si nécessaire.
+    Retourne une chaîne vide en cas d'échec (non bloquant pour l'indexation).
+    """
+    if not full_text.strip():
+        return ""
+
+    truncated = False
+    text_input = full_text
+    if len(full_text) > _SUMMARY_MAX_INPUT_CHARS:
+        text_input = full_text[:_SUMMARY_MAX_INPUT_CHARS]
+        truncated = True
+        print(
+            f"[~] '{filename}' truncated for summary: "
+            f"{len(full_text)} → {_SUMMARY_MAX_INPUT_CHARS} chars"
+        )
+
+    user_message = (
+        f"Voici le contenu du document '{filename}'"
+        + (" (tronqué, suite non disponible)" if truncated else "")
+        + f" :\n\n{text_input}\n\nRésume ce document selon les instructions."
+    )
+
+    try:
+        response = _llm_client.chat.completions.create(
+            model=_LLM_MODEL,
+            messages=[
+                {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            temperature=0.0,
+        )
+        summary = response.choices[0].message.content or ""
+        return summary.strip()
+    except Exception as e:
+        print(f"[!] Summary generation failed for '{filename}': {e}")
+        return ""
+
+
+# ─── Détection des capacités du modèle ──────────────────────────────────────
 
 def detect_model_capabilities(model) -> dict[str, Any]:
-    """
-    Detect if the loaded model supports dense vectors, sparse vectors, or both.
-    """
     capabilities = {
         "has_dense": False,
         "has_sparse": False,
@@ -110,6 +189,8 @@ def detect_model_capabilities(model) -> dict[str, Any]:
     except Exception as e:
         raise ValueError(f"Could not detect model capabilities: {e}")
 
+
+# ─── Détection d'encodage ────────────────────────────────────────────────────
 
 def detect_bom_encoding(raw: bytes) -> str | None:
     if raw.startswith(codecs.BOM_UTF8):
@@ -189,12 +270,14 @@ def guess_text_encodings(raw: bytes) -> list[str]:
     deduped = []
     seen = set()
     for enc in candidates:
-        if enc and enc not in seen:
+        if enc and not enc in seen:
             deduped.append(enc)
             seen.add(enc)
 
     return deduped
 
+
+# ─── Lecture des fichiers ────────────────────────────────────────────────────
 
 def read_text_document(filepath: Path) -> tuple[str, str]:
     raw = filepath.read_bytes()
@@ -219,14 +302,12 @@ def read_text_document(filepath: Path) -> tuple[str, str]:
 
 
 def read_pdf_document(filepath: Path) -> tuple[str, str]:
-    """
-    Lit un document PDF et le convertit en Markdown en utilisant pymupdf4llm.
-    """
-
     print(f"[~] Converting PDF to Markdown via pymupdf4llm: {filepath.name}")
     md_text = pymupdf4llm.to_markdown(str(filepath))
     return md_text, "pdf-to-markdown"
 
+
+# ─── Optimisation du contenu ─────────────────────────────────────────────────
 
 def optimize_json_preserving_standards(data: Any) -> str:
     def transform(obj: Any) -> Any:
@@ -238,13 +319,10 @@ def optimize_json_preserving_standards(data: Any) -> str:
                 else:
                     out[k] = transform(v)
             return out
-
         if isinstance(obj, list):
             return [transform(item) for item in obj]
-
         if isinstance(obj, str):
             return obj.strip()
-
         return obj
 
     optimized = transform(data)
@@ -411,7 +489,6 @@ def optimize_document_content(filepath: Path, text: str) -> tuple[str, bool]:
             optimized = optimize_html_content(text)
             return optimized, optimized != text
 
-        # Les PDF convertis en Markdown passent par ici également
         if ext in (".md", ".markdown", ".rst", ".adoc", ".txt", ".pdf"):
             optimized = optimize_markdown_content(text)
             return optimized, optimized != text
@@ -426,6 +503,8 @@ def optimize_document_content(filepath: Path, text: str) -> tuple[str, bool]:
         print(f"[!] Optimization failed for {filepath.name}: {e}")
         return text, False
 
+
+# ─── Utilitaires d'indexation ────────────────────────────────────────────────
 
 def generate_document_id(filepath: Path) -> str:
     base = str(filepath.resolve())
@@ -485,6 +564,8 @@ def split_text_uniformly(
     return chunks
 
 
+# ─── Gestion de la collection Qdrant ────────────────────────────────────────
+
 def setup_collection(capabilities: dict[str, Any]) -> bool:
     collections = client.get_collections().collections
     collection_exists = any(c.name == COLLECTION for c in collections)
@@ -543,24 +624,44 @@ def setup_collection(capabilities: dict[str, Any]) -> bool:
     else:
         raise ValueError("Model has neither dense nor sparse capability")
 
+    print("[~] Creating payload index for 'tags'...")
+    client.create_payload_index(
+        collection_name=COLLECTION,
+        field_name="tags",
+        field_schema=PayloadSchemaType.KEYWORD,
+    )
+    print("[✓] Payload index for 'tags' created.")
+
     return True
 
 
 def get_existing_ids():
     try:
-        result = client.scroll(
-            collection_name=COLLECTION,
-            limit=10000,
-            with_payload=False,
-            with_vectors=False,
-        )
-        existing_ids = {point.id for point in result[0]}
-        print(f"[~] Found {len(existing_ids)} existing documents")
+        existing_ids = set()
+        next_offset = None
+
+        while True:
+            result = client.scroll(
+                collection_name=COLLECTION,
+                limit=10000,
+                offset=next_offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            points, next_offset = result
+            existing_ids.update(point.id for point in points)
+
+            if next_offset is None:
+                break
+
+        print(f"[~] Found {len(existing_ids)} existing chunks")
         return existing_ids
     except Exception as e:
         print(f"[!] Failed to retrieve existing IDs: {e}")
         return set()
 
+
+# ─── Encodage et construction des points ────────────────────────────────────
 
 def _lexical_to_sparse_vector(lexical_weights: dict[Any, Any]) -> SparseVector:
     indices = [int(k) for k in lexical_weights.keys()]
@@ -665,13 +766,17 @@ def flush_batch(
     points: list[PointStruct],
     capabilities: dict[str, Any],
 ) -> int:
-    texts = [item["text"] for item in batch_docs]
-    encoded_vectors = encode_batch(texts, capabilities)
+    texts_to_embed = [
+        f"Source : {', '.join(item['payloadextra'].get('tags', []))}\nFichier : {item['filename']}\n\n{item['text']}" 
+        for item in batch_docs
+    ]
+    
+    encoded_vectors = encode_batch(texts_to_embed, capabilities)
 
     for item, vectors in zip(batch_docs, encoded_vectors):
         point = build_point(
             docid=item["docid"],
-            text=item["text"],
+            text=item["text"],  # Le payload UI conserve le texte brut (sans l'ajout)
             filename=item["filename"],
             encodingused=item["encoding"],
             vectors=vectors,
@@ -696,6 +801,8 @@ def flush_batch(
     return uploaded
 
 
+# ─── Indexation principale ───────────────────────────────────────────────────
+
 def index_documents():
     print("Detecting model capabilities...")
     capabilities = cf.MODEL_CAPABILITIES
@@ -718,7 +825,7 @@ def index_documents():
         print(f"[!] Directory not found: {docs_path}")
         return
 
-    print(f"[~] Scanning documents in {docs_path}")
+    print(f"[~] Scanning documents recursively in {docs_path}")
 
     def pushdoc(
         filename: str,
@@ -748,13 +855,23 @@ def index_documents():
             }
         )
 
-    for filepath in docs_path.iterdir():
+    for filepath in docs_path.rglob("*"):
         if not filepath.is_file():
             continue
+
+        relative_path = filepath.relative_to(docs_path)
+        tags = list(relative_path.parent.parts)
 
         ext = filepath.suffix.lower()
 
         try:
+            file_base64 = None
+            try:
+                with open(filepath, "rb") as f:
+                    file_base64 = base64.b64encode(f.read()).decode("utf-8")
+            except Exception as e:
+                print(f"[!] Warning: Could not base64 encode {filepath.name}: {e}")
+
             if ext == ".pdf":
                 text, encodingused = read_pdf_document(filepath)
             else:
@@ -780,23 +897,47 @@ def index_documents():
                 continue
 
             total_chunks += len(chunks)
-            print(f"[~] Chunked {filepath.name} into {len(chunks)} chunks")
+            print(f"[~] Chunked {filepath.name} into {len(chunks)} chunks (Tags: {tags})")
+
+            # ── Génération du résumé (une fois par document, si non déjà indexé) ──
+            chunk0_id = generate_chunk_stable_id(document_id, 0)
+            if not is_fresh and chunk0_id in existing_ids:
+                print(f"[~] Document already indexed, skipping summary: {filepath.name}")
+                doc_summary = None
+            else:
+                print(f"[~] Generating summary for '{filepath.name}'...")
+                doc_summary = generate_doc_summary(filepath.name, optimized_text)
+                if doc_summary:
+                    print(f"[✓] Summary generated ({len(doc_summary)} chars)")
+                else:
+                    print(f"[!] No summary generated for '{filepath.name}'")
+            # ─────────────────────────────────────────────────────────────────────
 
             for chunk_index, chunk_text in enumerate(chunks):
+                payload_extra = {
+                    "doctype": "uniform_chunk",
+                    "document_id": document_id,
+                    "chunk_index": chunk_index,
+                    "chunk_count": len(chunks),
+                    "is_child_chunk": True,
+                    "source_path": str(filepath.resolve()),
+                    "source_extension": filepath.suffix.lower(),
+                    "document_name": filepath.stem,
+                    "tags": tags,
+                }
+
+                # Chunk 0 : résumé + base64
+                if chunk_index == 0:
+                    if doc_summary:
+                        payload_extra["doc_summary"] = doc_summary
+                    if file_base64:
+                        payload_extra["file_base64"] = file_base64
+
                 pushdoc(
                     filename=filepath.name,
                     content=chunk_text,
                     encodingused=encodingused,
-                    payloadextra={
-                        "doctype": "uniform_chunk",
-                        "document_id": document_id,
-                        "chunk_index": chunk_index,
-                        "chunk_count": len(chunks),
-                        "is_child_chunk": True,
-                        "source_path": str(filepath.resolve()),
-                        "source_extension": filepath.suffix.lower(),
-                        "document_name": filepath.stem,
-                    },
+                    payloadextra=payload_extra,
                 )
 
                 if len(batch_docs) >= BATCH_SIZE:

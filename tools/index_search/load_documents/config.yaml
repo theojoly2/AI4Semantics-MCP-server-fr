@@ -6,7 +6,7 @@ qdrant:
   api_key: "QDRANT_API_KEY"
 
 collection:
-  name: "documents"
+  name: "documents_llm_v2"
 
 model:
   embedding: "BAAI/bge-m3"

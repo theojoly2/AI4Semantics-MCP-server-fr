@@ -9,6 +9,7 @@ from .model_metadata_checks import metadata_checker
 from .semantic_reuse_of_existing_concepts_checks import reuse_check
 from .style_guide_checks import style_guide_check
 from .style_guide_validator import validator_check
+from .index_search import get_available_tags
 
 
 __all__ = [
@@ -23,4 +24,5 @@ __all__ = [
     "reuse_check",
     "style_guide_check",
     "validator_check",
+    "get_available_tags",
 ]

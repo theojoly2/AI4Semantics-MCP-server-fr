@@ -1566,8 +1566,8 @@ def build_graph_from_xmi_model(
 
 
 def graph_from_model(model: dict[str, Any], user: str = "", name: str = "") -> Graph:
-    print(f"[DEBUG graph_from_model] Chargement du graphe RDF à partir du modèle...")
-    
+    print("[DEBUG graph_from_model] Chargement du graphe RDF à partir du modèle...")
+
     # PRIORITÉ 1 : Si nous avons du Turtle brut (ttl_raw), c'est la vérité sémantique absolue et la plus à jour.
     ttl_raw = _norm_text(model.get("ttl_raw"))
     if ttl_raw:
@@ -1598,14 +1598,14 @@ def graph_from_model(model: dict[str, Any], user: str = "", name: str = "") -> G
     # PRIORITÉ 3 : Si on n'a ni ttl_raw, ni éléments UML, mais qu'on a du XMI brut, on le parse.
     raw_xmi = _norm_text(model.get("xmi_raw")) or _norm_text(model.get("xmi_xml"))
     if raw_xmi:
-        print(f"[DEBUG graph_from_model] Source détectée : XMI brut d'importation (sans éléments pré-existants).")
+        print("[DEBUG graph_from_model] Source détectée : XMI brut d'importation (sans éléments pré-existants).")
         return build_graph_from_xmi_model(
             model,
             user=user,
             name=name or _norm_text(model.get("name")) or "Generated",
         )
 
-    print(f"[DEBUG graph_from_model] Aucune source détectée, création d'un nouveau graphe sémantique vierge.")
+    print("[DEBUG graph_from_model] Aucune source détectée, création d'un nouveau graphe sémantique vierge.")
     return _new_graph(user, name or "Generated")
 
 
@@ -1948,7 +1948,7 @@ def add_attribute(
                 target_uri = URIRef(f"urn:class:{_slugify_uri(attr_type)}")
             g.add((target_uri, RDF.type, OWL.Class))
             _set_literal(g, target_uri, RDFS.label, attr_type, lang="fr")
-        
+
         _set_uri(g, prop_uri, RDFS.range, target_uri)
 
     model = _sync_model_from_graph(
@@ -2035,7 +2035,7 @@ def add_connector(
         _add_uri(g, prop_uri, RDFS.domain, source_uri)
         _add_uri(g, prop_uri, RDFS.range, target_uri)
         _set_literal(g, prop_uri, UML_META.relationshipType, relationship)
-        
+
         # Insertion des cardinalités dans le graphe sémantique RDF
         _set_literal(g, prop_uri, UML_META.leftMultiplicity, lb)
         _set_literal(g, prop_uri, UML_META.rightMultiplicity, rb)

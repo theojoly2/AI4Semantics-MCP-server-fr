@@ -94,6 +94,12 @@ mcp.add_tool(
     )
 )
 
+mcp.add_tool(
+    Tool.from_function(
+        tools.get_available_tags,
+        name="get_available_tags",
+    )
+)
 
 mcp.resource(
     "resource://model/{user}/{session_name}",
