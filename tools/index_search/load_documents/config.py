@@ -4,15 +4,24 @@ from os import getenv, environ
 PROJECT_ROOT = Path(__file__).resolve().parent
 environ["HF_HOME"] = str(PROJECT_ROOT / ".cache_hf")
 
-from typing import Any
+from typing import Any, List, Tuple, Union
 
 from yaml import safe_load
 from qdrant_client import QdrantClient
 from dotenv import load_dotenv
 
-from typing import List, Tuple, Union
 import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModel
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    BitsAndBytesConfig,
+)
+
+from optimum.onnxruntime import ORTModelForSequenceClassification
+from optimum.exporters.onnx import main_export
+from onnxruntime.quantization import quantize_dynamic, QuantType
+from huggingface_hub import snapshot_download
+from filelock import FileLock
 
 load_dotenv()
 
@@ -22,95 +31,115 @@ with CONFIG_PATH.open("r", encoding="utf-8") as f:
     config = safe_load(f)
 
 
+# =========================================================
+# RERANKER
+# =========================================================
 class HFTransformerReranker:
     """
-    Reranker basé sur Hugging Face Transformers.
-
-    Supporte :
-    - les modèles de type BAAI/bge-reranker-* via AutoModelForSequenceClassification,
-    - le modèle jinaai/jina-reranker-v3 via AutoModel(trust_remote_code=True)
-      et sa méthode listwise `model.rerank(query, documents, ...)`.
+    GPU  → FP16
+    CPU  → ONNX INT8 (Q8 auto export + quantization)
     """
 
-    def __init__(self, model_name: str, use_fp16: bool = True, device: str = None):
+    def __init__(self, model_name: str, device: str = None):
         self.model_name = model_name
-
-        # Détection simple du mode Jina v3 listwise
-        self.is_jina_listwise = "jina-reranker-v3" in model_name
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
+
         self.device = device
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-        if self.is_jina_listwise:
-            # Jina v3 : modèle avec code distant et méthode .rerank(query, documents, ...)
-            self.tokenizer = None
-            self.model = AutoModel.from_pretrained(
-                model_name,
-                trust_remote_code=True,
-                torch_dtype="auto",
-            )
+        if self.device == "cuda":
+            self.model = self._load_gpu()
         else:
-            # BGE & autres rerankers "classiques" (sequence classification)
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
+            self.model = self._load_cpu_q8()
 
-        self.model.eval()
-        self.model.to(self.device)
+    # =====================================================
+    # GPU FP16
+    # =====================================================
+    def _load_gpu(self):
+        model = AutoModelForSequenceClassification.from_pretrained(
+            self.model_name,
+            torch_dtype=torch.float16,
+        )
+        return model.to(self.device)
 
-        self.use_fp16 = use_fp16 and (self.device == "cuda")
-        if self.use_fp16:
-            self.model = self.model.to(dtype=torch.float16)
+    # =====================================================
+    # CPU ONNX + AUTO Q8
+    # =====================================================
+    def _load_cpu_q8(self):
+        base_dir = PROJECT_ROOT / "models/onnx"
+        fp32_dir = base_dir / "bge-reranker-v2-m3"
+        int8_dir = base_dir / "bge-reranker-v2-m3-int8"
 
+        lock = FileLock(str(int8_dir) + ".lock")
+
+        with lock:
+
+            # -----------------------------
+            # 1. si INT8 existe → direct
+            # -----------------------------
+            if int8_dir.exists() and any(int8_dir.iterdir()):
+                print(f"✓ Loading ONNX INT8 reranker: {int8_dir}")
+                return ORTModelForSequenceClassification.from_pretrained(
+                    str(int8_dir)
+                )
+
+            # -----------------------------
+            # 2. sinon FP32 ONNX existe ?
+            # -----------------------------
+            if not fp32_dir.exists() or not any(fp32_dir.iterdir()):
+                print("⚠ Export ONNX FP32...")
+
+                snapshot_download(repo_id=self.model_name)
+
+                main_export(
+                    model_name_or_path=self.model_name,
+                    output=str(fp32_dir),
+                    task="text-classification",
+                )
+
+                print(f"✓ FP32 ONNX exported → {fp32_dir}")
+
+            # -----------------------------
+            # 3. quantization INT8 (Q8)
+            # -----------------------------
+            print("⚡ Quantizing ONNX → INT8 (Q8)...")
+
+            fp32_model = fp32_dir / "model.onnx"
+            int8_model = int8_dir
+
+            int8_model.mkdir(parents=True, exist_ok=True)
+
+            quantize_dynamic(
+                model_input=str(fp32_model),
+                model_output=str(int8_model / "model.onnx"),
+                weight_type=QuantType.QInt8,
+            )
+
+            # copier config/tokenizer
+            for f in fp32_dir.glob("*"):
+                if f.suffix != ".onnx":
+                    (int8_model / f.name).write_bytes(f.read_bytes())
+
+            print(f"✓ INT8 ONNX ready → {int8_model}")
+
+        print(f"✓ Loading ONNX INT8 reranker: {int8_dir}")
+
+        return ORTModelForSequenceClassification.from_pretrained(
+            str(int8_dir)
+        )
+
+    # =====================================================
+    # SCORE
+    # =====================================================
     @torch.inference_mode()
-    def compute_score(
-        self,
-        sentence_pairs: Union[Tuple[str, str], List[Tuple[str, str]]],
-        normalize: bool = False,
-        max_length: int = 512,  # garde le param pour BGE, mais PAS utilisé pour Jina v3
-    ):
-        # Autoriser un seul couple ou une liste de couples
+    def compute_score(self, sentence_pairs, normalize=False, max_length=512):
         if isinstance(sentence_pairs, tuple):
             pairs = [sentence_pairs]
         else:
             pairs = list(sentence_pairs)
 
-        # ------- Mode Jina v3 : listwise reranking via model.rerank(query, documents) -------
-        if self.is_jina_listwise:
-            # On suppose le cas classique "une seule requête, plusieurs documents"
-            queries = [q for q, _ in pairs]
-            docs = [d for _, d in pairs]
-
-            unique_queries = list(dict.fromkeys(queries))
-            if len(unique_queries) != 1:
-                raise ValueError(
-                    "HFTransformerReranker (jina-reranker-v3) attend une seule query "
-                    "pour plusieurs documents. Toutes les paires doivent partager la même query."
-                )
-            query = unique_queries[0]
-
-            # Signature officielle v3 : rerank(query, documents, top_n=None, return_embeddings=False)
-            # → pas de max_length / max_doc_length ici. [web:296]
-            result = self.model.rerank(
-                query=query,
-                documents=docs,
-                top_n=None,             # on garde tout
-                return_embeddings=False,
-            )
-
-            # On reconstruit une liste de scores alignée sur l’ordre des docs
-            scores = [0.0] * len(docs)
-            for item in result:
-                idx = item.get("index")
-                score = item.get("relevance_score", item.get("score", 0.0))
-                if idx is not None and 0 <= idx < len(docs):
-                    scores[idx] = float(score)
-
-            if isinstance(sentence_pairs, tuple):
-                return scores[0]
-            return scores
-
-        # ------- Mode BGE / cross-encoder classique : pairwise (query, doc) → logit -------
         queries = [q for q, _ in pairs]
         docs = [d for _, d in pairs]
 
@@ -121,20 +150,29 @@ class HFTransformerReranker:
             truncation=True,
             max_length=max_length,
             return_tensors="pt",
-        ).to(self.device)
+        )
+
+        if self.device == "cuda":
+            inputs = {k: v.to("cuda") for k, v in inputs.items()}
 
         logits = self.model(**inputs).logits.view(-1)
 
         scores = logits.float()
+
         if normalize:
             scores = torch.sigmoid(scores)
 
         scores = scores.cpu().tolist()
+
         if isinstance(sentence_pairs, tuple):
             return scores[0]
+
         return scores
 
 
+# =========================================================
+# QDRANT
+# =========================================================
 def _load_qdrant_client() -> QdrantClient:
     qdrant_cfg = config["qdrant"]
 
@@ -151,16 +189,16 @@ def _load_qdrant_client() -> QdrantClient:
     )
 
 
+# =========================================================
+# EMBEDDINGS
+# =========================================================
 def _load_embedding_model():
     model_embedding = config["model"]["embedding"]
 
     if "bge-m3" in model_embedding.lower():
         from FlagEmbedding import BGEM3FlagModel
 
-        model = BGEM3FlagModel(
-            model_embedding,
-            use_fp16=True,
-        )
+        model = BGEM3FlagModel(model_embedding, use_fp16=True)
         print(f"✓ Loaded hybrid embedding model: {model_embedding}")
         return model
 
@@ -171,22 +209,22 @@ def _load_embedding_model():
     return model
 
 
+# =========================================================
+# RERANKER LOADER
+# =========================================================
 def _load_reranker_model():
     model_reranker = config["model"]["reranker"]
 
-    reranker = HFTransformerReranker(
-        model_name=model_reranker,
-        use_fp16=True,
-    )
-    print(f"✓ Loaded reranker model (HF): {model_reranker}")
+    reranker = HFTransformerReranker(model_name=model_reranker)
+
+    print(f"✓ Loaded reranker: {model_reranker}")
     return reranker
 
 
+# =========================================================
+# CAPABILITIES SAFE (BGE-M3 FIX)
+# =========================================================
 def _detect_model_capabilities(model) -> dict[str, Any]:
-    """
-    Detect whether model supports dense, sparse, or both.
-    Runs once at startup.
-    """
     capabilities = {
         "has_dense": False,
         "has_sparse": False,
@@ -203,35 +241,58 @@ def _detect_model_capabilities(model) -> dict[str, Any]:
             return_colbert_vecs=False,
         )
 
+        # ---------------- bge-m3 dict output ----------------
         if isinstance(result, dict):
-            dense_vecs = result.get("dense_vecs")
-            lexical_weights = result.get("lexical_weights")
+            dense = result.get("dense_vecs")
 
-            if dense_vecs is not None and len(dense_vecs) > 0:
+            if dense is not None and len(dense) > 0:
+                vec = dense[0]
                 capabilities["has_dense"] = True
-                capabilities["dense_dim"] = len(dense_vecs[0])
+                capabilities["dense_dim"] = len(vec)
 
-            if lexical_weights is not None:
+            if result.get("lexical_weights") is not None:
                 capabilities["has_sparse"] = True
 
             return capabilities
 
-    except Exception:
-        pass
+        # ---------------- numpy / list / tensor ----------------
+        if result is not None:
 
-    try:
-        dense = model.encode([test_text])
-        first_dense = dense[0] if hasattr(dense, "__len__") else dense
-        capabilities["has_dense"] = True
-        capabilities["dense_dim"] = len(first_dense)
+            # numpy array safe check
+            try:
+                import numpy as np
+                if isinstance(result, np.ndarray):
+                    if result.size > 0:
+                        vec = result[0]
+                        capabilities["has_dense"] = True
+                        capabilities["dense_dim"] = len(vec)
+                        return capabilities
+            except Exception:
+                pass
+
+            # list / tensor fallback
+            try:
+                if hasattr(result, "__len__") and len(result) > 0:
+                    vec = result[0]
+
+                    # si déjà vector 1D
+                    if isinstance(vec, (float, int)):
+                        vec = result
+
+                    capabilities["has_dense"] = True
+                    capabilities["dense_dim"] = len(vec)
+            except Exception:
+                pass
+
         return capabilities
 
     except Exception as e:
-        raise ValueError(
-            f"Could not detect model capabilities for configured embedding model: {e}"
-        ) from e
+        raise ValueError(f"Embedding capability detection failed: {e}") from e
 
 
+# =========================================================
+# INIT
+# =========================================================
 client = _load_qdrant_client()
 
 EMBEDDING_MODEL_NAME = config["model"]["embedding"]
@@ -242,43 +303,29 @@ RERANKER_MODEL = _load_reranker_model()
 
 MODEL_CAPABILITIES = _detect_model_capabilities(EMBEDDING_MODEL)
 
-# Backward compatibility with existing code
 model = EMBEDDING_MODEL
 reranker = RERANKER_MODEL
 
-# Qdrant collection name used for indexing and retrieval.
 COLLECTION = config["collection"]["name"]
 
-# Number of chunks uploaded per indexing batch.
 BATCH_SIZE = int(config["indexing"].get("batch_size", 5))
 BATCHSIZE = BATCH_SIZE
 
-# Root directory containing source documents to index.
 DOCUMENTS_PATH = config["indexing"].get("documents_path", "documents")
 
-# Maximum number of final search results returned.
 SEARCH_LIMIT = int(config.get("search", {}).get("limit", 3))
-
-# Oversampling factor used to fetch more raw candidates before final selection.
 CANDIDATE_MULTIPLIER = int(config.get("search", {}).get("candidate_multiplier", 10))
-
-# Minimum number of raw candidates to inspect before post-processing.
 MIN_CANDIDATES = int(config.get("search", {}).get("min_candidates", 30))
-
-# Maximum number of chunks scanned for a single document during contextual reconstruction.
 SCROLL_LIMIT_PER_DOC = int(config.get("search", {}).get("scroll_limit_per_doc", 10000))
-
-# Number of neighboring chunks fetched on each side of a relevant chunk.
 WINDOW_RADIUS = int(config.get("search", {}).get("window_radius", 4))
 
-# If a document has at most this many chunks,
-# the full document can be reconstructed instead of a local window.
 FULL_DOCUMENT_CHUNK_THRESHOLD = int(
     config.get("search", {}).get("full_document_chunk_threshold", 12)
 )
 
 DENSE_VECTOR_NAME = "dense"
 SPARSE_VECTOR_NAME = "sparse"
+
 
 print(
     "✓ Embedding model capabilities:",
@@ -288,4 +335,5 @@ print(
         "dense_dim": MODEL_CAPABILITIES["dense_dim"],
     },
 )
+
 print(f"✓ Reranker ready: {RERANKER_MODEL_NAME}")

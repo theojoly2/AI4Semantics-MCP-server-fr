@@ -206,3 +206,4 @@ cython_debug/
 
 # persistance modèles embedding et reranker
 .cache_hf
+tools/index_search/load_documents/models

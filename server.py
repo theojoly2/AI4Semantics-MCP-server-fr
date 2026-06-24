@@ -1,5 +1,13 @@
+import os
+# Désactive le parallélisme interne du Tokenizer HuggingFace pour éviter les deadlocks
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 from dotenv import load_dotenv
 from pathlib import Path
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import functools
+from typing import List, Optional, Any
 
 from fastmcp import FastMCP
 from fastmcp.tools import Tool
@@ -7,15 +15,61 @@ from fastmcp.server.event_store import EventStore
 import resources
 import tools
 
+# Importation de l'outil de téléchargement de fichier (pour l'UI)
+try:
+    from file_tool import get_document_file
+except ImportError:
+    pass
+
 project_dir = Path(__file__).resolve().parent
 env_path = project_dir / ".env"
 
 load_dotenv(dotenv_path=env_path)
 
-# CHANGE FOR DEPLOYMENT/DEVELOPMENT!
+# ====================================================================
+# CRÉATION DU POOL DE THREADS
+# max_workers=2 : On autorise 2 recherches SIMULTANÉES lourdes en arrière-plan.
+# ====================================================================
+ai_thread_pool = ThreadPoolExecutor(max_workers=2)
+
 mcp = FastMCP(
-    name="...",
+    name="DataModellingServer",
 )
+
+
+# ====================================================================
+# WRAPPER ASYNCHRONE POUR LA RECHERCHE
+# Transforme la fonction lourde en tâche asynchrone pour ne pas bloquer le serveur
+# ====================================================================
+async def async_retrieve_documents(
+    search_terms: str, 
+    limit: int = 10, 
+    return_full_document: bool = True, 
+    tags: Optional[List[str]] = None
+) -> list:
+    """
+    Recherche des documents ou standards dans la base de connaissances.
+    """
+    loop = asyncio.get_running_loop()
+
+    # Prépare la fonction avec ses arguments
+    func = functools.partial(
+        tools.retrieve_documents,
+        search_terms=search_terms,
+        limit=limit,
+        return_full_document=return_full_document,
+        tags=tags
+    )
+
+    # Exécution dans le thread pool
+    results = await loop.run_in_executor(ai_thread_pool, func)
+
+    return results
+
+
+# ====================================================================
+# ENREGISTREMENT DES OUTILS
+# ====================================================================
 
 mcp.add_tool(
     Tool.from_function(
@@ -33,7 +87,7 @@ mcp.add_tool(
 
 mcp.add_tool(
     Tool.from_function(
-        tools.retrieve_documents,
+        async_retrieve_documents,
         name="retrieve_documents",
     )
 )
@@ -100,6 +154,10 @@ mcp.add_tool(
         name="get_available_tags",
     )
 )
+
+# ====================================================================
+# ENREGISTREMENT DES RESSOURCES
+# ====================================================================
 
 mcp.resource(
     "resource://model/{user}/{session_name}",
