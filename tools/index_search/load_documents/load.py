@@ -767,10 +767,10 @@ def flush_batch(
     capabilities: dict[str, Any],
 ) -> int:
     texts_to_embed = [
-        f"Source : {', '.join(item['payloadextra'].get('tags', []))}\nFichier : {item['filename']}\n\n{item['text']}" 
+        f"Source : {', '.join(item['payloadextra'].get('tags', []))}\nFichier : {item['filename']}\n\n{item['text']}"
         for item in batch_docs
     ]
-    
+
     encoded_vectors = encode_batch(texts_to_embed, capabilities)
 
     for item, vectors in zip(batch_docs, encoded_vectors):
