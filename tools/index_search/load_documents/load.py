@@ -632,6 +632,14 @@ def setup_collection(capabilities: dict[str, Any]) -> bool:
     )
     print("[✓] Payload index for 'tags' created.")
 
+    print("[~] Creating payload index for 'document_id'...")
+    client.create_payload_index(
+        collection_name=COLLECTION,
+        field_name="document_id",
+        field_schema=PayloadSchemaType.KEYWORD,
+    )
+    print("[✓] Payload index for 'document_id' created.")
+
     return True
 
 
