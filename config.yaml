@@ -1,6 +1,11 @@
 file_paths:
-  style_guide: "resources/semantic_conventions/style_guide/style_guide.txt"
-  style_guide_xls: "resources/semantic_conventions/style_guide/SEMIC_Style_Guide.xlsx"
-
 dir_paths:
-  models: "resources/semantic_model/models"
+
+link_resolver:
+  max_depth: 1
+  max_links_per_step: 5
+  min_score_threshold: 0.5
+
+concept_comparator:
+  max_terms: 5
+  min_results_per_term: 3

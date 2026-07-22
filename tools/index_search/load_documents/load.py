@@ -5,8 +5,8 @@ import codecs
 import json
 import csv
 import os
-from io import StringIO
-from typing import Any
+from io import StringIO, BytesIO
+from typing import Any, Iterable
 import pymupdf4llm
 import base64
 
@@ -26,6 +26,28 @@ try:
     from .load_documents import config as cf
 except ImportError:
     import config as cf
+
+# ─── Parsers optionnels pour formats enrichis ───────────────────────────────
+try:
+    import openpyxl
+except ImportError:
+    openpyxl = None
+
+try:
+    from rdflib import Graph, Namespace, URIRef, Literal
+    from rdflib.namespace import RDF, RDFS, SKOS
+except ImportError:
+    Graph = Namespace = URIRef = Literal = RDF = RDFS = SKOS = None
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 
 # ─── Chargement du .env à la racine du projet ───────────────────────────────
@@ -299,6 +321,841 @@ def read_text_document(filepath: Path) -> tuple[str, str]:
         f"Unable to decode file {filepath.name}. "
         f"Tried encodings: {', '.join(encodings_to_try)}"
     )
+
+
+# ─── Parsers spécialisés par type de document ───────────────────────────────
+
+RE_ARTICLE_HEADER = re.compile(
+    r"^(Article|Art\.?)\s+([LRD]?\d+[\d\-\.]*(?:\s*-\s*\d+)?)\.?\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+RE_ARTICLE_MENTION = re.compile(
+    r"\b(?:article|art\.?)\s+([LRD]?\d+[\d\-\.]*(?:\s*-\s*\d+)?)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_article_ref(match_text: str) -> str:
+    """Normalise une référence d'article pour matching."""
+    return re.sub(r"\s+", "", match_text.upper()).replace("ART.", "").replace("ARTICLE", "")
+
+
+def parse_legal_articles(text: str) -> list[tuple[str | None, str]]:
+    """
+    Découpe un texte juridique en articles.
+    Retourne une liste de (numéro_article_ou_None, contenu_article).
+    """
+    parts = RE_ARTICLE_HEADER.split(text)
+    if len(parts) <= 1:
+        return [(None, text)]
+
+    result = []
+    current_article = None
+    current_buffer = []
+
+    i = 0
+    while i < len(parts):
+        if parts[i] is None:
+            i += 1
+            continue
+        if re.match(r"^(article|art\.?)$", parts[i], re.IGNORECASE):
+            # Flush previous
+            if current_buffer:
+                content = "\n".join(current_buffer).strip()
+                if content:
+                    result.append((current_article, content))
+                current_buffer = []
+            current_article = parts[i + 1].strip() if i + 1 < len(parts) else None
+            i += 2
+            continue
+        current_buffer.append(parts[i])
+        i += 1
+
+    if current_buffer:
+        content = "\n".join(current_buffer).strip()
+        if content:
+            result.append((current_article, content))
+
+    return result
+
+
+def extract_cited_articles(text: str) -> list[str]:
+    """Extrait les mentions d'articles cités dans un texte."""
+    refs = set()
+    for m in RE_ARTICLE_MENTION.finditer(text):
+        refs.add(_normalize_article_ref(m.group(1)))
+    return sorted(refs)
+
+
+def _detect_term_column(headers: list[str], rows: list[dict[str, str]]) -> str | None:
+    """Détecte automatiquement la colonne contenant le terme/concept."""
+    lower_headers = [h.strip().lower() for h in headers]
+
+    term_candidates = [
+        "terme", "term", "terme français", "terme anglais", "libellé", "label",
+        "mot", "concept", "entrée", "intitulé", "name", "title", "mot-clé",
+        "mot clef", "keyword", "expression", "forme", "vocable", "appellation",
+        "dénomination", "nom", "titre", "acronyme", "sigle", "abréviation",
+        "term_id", "id", "code", "identifiant",
+    ]
+    for term_candidate in term_candidates:
+        if term_candidate in lower_headers:
+            return headers[lower_headers.index(term_candidate)]
+
+    # Heuristique sur le contenu : colonne avec les textes les plus courts en moyenne
+    if rows:
+        avg_lengths = []
+        for h in headers:
+            lengths = [len(row.get(h, "").strip()) for row in rows[:50] if row.get(h, "").strip()]
+            if lengths:
+                avg_lengths.append((h, sum(lengths) / len(lengths)))
+        if avg_lengths:
+            avg_lengths.sort(key=lambda x: x[1])
+            # On prend la colonne la plus courte, à condition qu'elle soit significativement plus courte que la suivante
+            if len(avg_lengths) >= 2 and avg_lengths[0][1] * 3 < avg_lengths[1][1]:
+                return avg_lengths[0][0]
+            # Sinon on prend la première colonne si elle a des valeurs courtes
+            if avg_lengths[0][1] <= 100:
+                return avg_lengths[0][0]
+
+    # Fallback : première colonne non vide
+    return headers[0] if headers else None
+
+
+def _detect_definition_column(headers: list[str], rows: list[dict[str, str]]) -> str | None:
+    """Détecte automatiquement la colonne contenant la définition."""
+    lower_headers = [h.strip().lower() for h in headers]
+
+    def_candidates = [
+        "définition", "definition", "définitions", "definitions", "sens",
+        "signification", "description", "explication", "note", "notes",
+        "commentaire", "remarque", "exemple", "contexte", "usage", "domaine",
+        "meaning", "sense", "gloss", "explanatory", "scope note",
+    ]
+    for def_candidate in def_candidates:
+        if def_candidate in lower_headers:
+            return headers[lower_headers.index(def_candidate)]
+
+    # Heuristique sur le contenu : colonne avec les textes les plus longs en moyenne
+    if rows:
+        avg_lengths = []
+        for h in headers:
+            lengths = [len(row.get(h, "").strip()) for row in rows[:50] if row.get(h, "").strip()]
+            if lengths:
+                avg_lengths.append((h, sum(lengths) / len(lengths)))
+        if avg_lengths:
+            avg_lengths.sort(key=lambda x: x[1], reverse=True)
+            if avg_lengths[0][1] >= 30:
+                return avg_lengths[0][0]
+
+    return None
+
+
+def _has_header_row(raw_lines: list[str], delimiter: str) -> bool:
+    """Détecte si la première ligne est un en-tête ou une donnée."""
+    if len(raw_lines) < 2:
+        return False
+    first_line = raw_lines[0].strip()
+    parts = first_line.split(delimiter)
+    if len(parts) <= 1:
+        return False
+
+    # Heuristique 1 : mots-clés d'en-tête connus
+    known_header_keywords = {
+        "terme", "term", "définition", "definition", "libellé", "label",
+        "description", "name", "concept", "titre", "title", "mot", "entrée",
+        "explication", "domaine", "source", "note", "commentaire", "exemple",
+        "id", "code", "identifiant", "acronyme", "sigle", "abréviation",
+    }
+    keyword_score = 0
+    for p in parts:
+        p_norm = p.strip().lower().rstrip("s")
+        if p_norm in known_header_keywords:
+            keyword_score += 1
+
+    if keyword_score >= 1 and keyword_score >= len(parts) * 0.25:
+        return True
+
+    # Heuristique 2 : comparer ligne 1 et ligne 2
+    # Une ligne d'en-tête est typiquement plus courte et a une structure différente de la ligne suivante
+    second_line = raw_lines[1].strip()
+    second_parts = second_line.split(delimiter)
+    if len(second_parts) != len(parts):
+        return False
+
+    first_avg_len = sum(len(p.strip()) for p in parts) / len(parts)
+    second_avg_len = sum(len(p.strip()) for p in second_parts) / len(parts)
+
+    # L'en-tête est nettement plus court que la première ligne de données
+    if second_avg_len > first_avg_len * 2 and first_avg_len <= 30:
+        return True
+
+    # Heuristique 3 : la première ligne ressemble à des noms courts, la deuxième à du contenu
+    first_is_short = sum(1 for p in parts if len(p.strip().split()) <= 3) >= len(parts) * 0.7
+    second_is_longer = second_avg_len > first_avg_len * 1.5
+
+    if first_is_short and second_is_longer and first_avg_len <= 40:
+        return True
+
+    return False
+
+
+def chunk_glossary_table(text: str, delimiter: str = ",") -> list[dict[str, Any]]:
+    """
+    Parse un fichier de glossaire tabulaire (CSV/TSV).
+    Chaque ligne devient un chunk avec terme/définition.
+    Fonctionne avec ou sans ligne d'en-tête.
+    """
+    raw_lines = [line for line in text.splitlines() if line.strip()]
+    if not raw_lines:
+        return []
+
+    has_header = _has_header_row(raw_lines, delimiter)
+
+    if has_header:
+        reader = csv.DictReader(StringIO(text), delimiter=delimiter)
+        rows = list(reader)
+        headers = list(rows[0].keys()) if rows else []
+    else:
+        # Sans en-tête : on génère des noms de colonnes
+        first_parts = raw_lines[0].split(delimiter)
+        headers = [f"col_{i}" for i in range(len(first_parts))]
+        rows = []
+        for line in raw_lines:
+            parts = line.split(delimiter)
+            # Gérer le cas où il y aurait plus ou moins de colonnes
+            row = {headers[i]: parts[i].strip() if i < len(parts) else "" for i in range(len(headers))}
+            rows.append(row)
+
+    if not rows:
+        return []
+
+    term_col = _detect_term_column(headers, rows)
+    definition_col = _detect_definition_column(headers, rows)
+
+    chunks = []
+    for idx, row in enumerate(rows):
+        if not any(v.strip() for v in row.values()):
+            continue
+
+        term = row.get(term_col, "").strip() if term_col else ""
+        definition = row.get(definition_col, "").strip() if definition_col else ""
+
+        lines = []
+        for h in headers:
+            v = row.get(h, "").strip()
+            if v:
+                lines.append(f"{h.strip()} : {v}")
+        body = "\n".join(lines)
+
+        # Si on n'a pas trouvé de terme, utiliser le premier champ non vide
+        if not term and body:
+            term = next((row.get(h, "").strip() for h in headers if row.get(h, "").strip()), "")
+
+        chunks.append({
+            "text": body,
+            "doctype": "glossary_entry",
+            "term": term,
+            "definition": definition,
+            "chunk_index": idx,
+        })
+
+    return chunks
+
+
+def chunk_excel(filepath: Path) -> list[dict[str, Any]]:
+    """Parse un fichier Excel de glossaire ligne par ligne."""
+    if openpyxl is None:
+        raise ImportError("openpyxl is required for .xlsx files")
+
+    wb = openpyxl.load_workbook(filepath, data_only=True)
+    chunks = []
+    idx = 0
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        rows = list(ws.iter_rows(values_only=False))
+        if not rows:
+            continue
+
+        # Détecter si la première ligne est un en-tête
+        first_values = [cell.value for cell in rows[0]]
+        has_header = _has_header_row(
+            [delimiter.join(str(v or "") for v in first_values)],
+            delimiter=","
+        )
+
+        if has_header:
+            header_row = rows[0]
+            headers = []
+            for cell in header_row:
+                val = cell.value
+                headers.append(str(val).strip() if val is not None else f"col_{len(headers)}")
+            data_rows = rows[1:]
+        else:
+            headers = [f"col_{i}" for i in range(len(first_values))]
+            data_rows = rows
+
+        term_col = _detect_term_column(headers, [
+            {h: str(cell.value or "").strip() for h, cell in zip(headers, row)} for row in data_rows[:50]
+        ])
+        definition_col = _detect_definition_column(headers, [
+            {h: str(cell.value or "").strip() for h, cell in zip(headers, row)} for row in data_rows[:50]
+        ])
+
+        for raw_row in data_rows:
+            values = [cell.value for cell in raw_row]
+            if all(v is None or str(v).strip() == "" for v in values):
+                continue
+
+            row = {headers[i]: (str(v).strip() if v is not None else "") for i, v in enumerate(values)}
+            term = row.get(term_col, "") if term_col else ""
+            definition = row.get(definition_col, "") if definition_col else ""
+
+            lines = [f"{h} : {v}" for h, v in row.items() if v]
+            body = "\n".join(lines)
+
+            if not term and body:
+                term = next((row.get(h, "").strip() for h in headers if row.get(h, "").strip()), "")
+
+            chunks.append({
+                "text": body,
+                "doctype": "glossary_entry",
+                "term": term,
+                "definition": definition,
+                "chunk_index": idx,
+                "sheet": sheet_name,
+            })
+            idx += 1
+
+    return chunks
+
+
+def _rdf_text_value(graph, subject, predicate) -> str:
+    if graph is None:
+        return ""
+    for obj in graph.objects(subject, predicate):
+        if isinstance(obj, Literal):
+            return str(obj)
+    return ""
+
+
+def _rdf_list_values(graph, subject, predicate) -> list[str]:
+    if graph is None:
+        return []
+    out = []
+    for obj in graph.objects(subject, predicate):
+        if isinstance(obj, Literal):
+            out.append(str(obj))
+    return out
+
+
+def _rdf_uri_list(graph, subject, predicate) -> list[str]:
+    if graph is None:
+        return []
+    return [str(obj) for obj in graph.objects(subject, predicate)]
+
+
+def _rdf_expand_namespace(graph, uri: str) -> str:
+    """Essaye de convertir une URI compacte en URI complète si possible."""
+    if isinstance(uri, URIRef):
+        return str(uri)
+    return str(uri)
+
+
+def chunk_rdf(filepath: Path, text: str, base_document_id: str) -> list[dict[str, Any]]:
+    """
+    Parse un fichier RDF et retourne un chunk par concept/ressource.
+    Accepte SKOS, OWL, RDFS et d'autres vocabulaires.
+    """
+    if Graph is None:
+        raise ImportError("rdflib is required for RDF files")
+
+    g = Graph()
+
+    # Essayer plusieurs formats de sérialisation
+    parsed = False
+    for fmt in ("turtle", "xml", "json-ld", "n3", "nt", "trig"):
+        try:
+            g.parse(data=text, format=fmt)
+            parsed = True
+            break
+        except Exception:
+            continue
+
+    if not parsed:
+        try:
+            g.parse(data=text)
+            parsed = True
+        except Exception as e:
+            raise ValueError(f"Could not parse RDF file {filepath.name}: {e}")
+
+    # Namespaces connus pour les liens hiérarchiques
+    RDFS = Namespace("http://www.w3.org/2000/01/rdf-schema#")
+    OWL = Namespace("http://www.w3.org/2002/07/owl#")
+    DC = Namespace("http://purl.org/dc/elements/1.1/")
+    DCTERMS = Namespace("http://purl.org/dc/terms/")
+    SCHEMA = Namespace("http://schema.org/")
+
+    # Prédicats de libellés (ordre de priorité)
+    label_predicates = [
+        SKOS.prefLabel,
+        RDFS.label,
+        DCTERMS.title,
+        DC.title,
+        SCHEMA.name,
+        SKOS.altLabel,
+    ]
+
+    # Prédicats de définition (ordre de priorité)
+    definition_predicates = [
+        SKOS.definition,
+        RDFS.comment,
+        DCTERMS.description,
+        DC.description,
+        SCHEMA.description,
+        SKOS.scopeNote,
+        SKOS.note,
+        RDFS.isDefinedBy,
+    ]
+
+    # Prédicats de synonymes
+    synonym_predicates = [
+        SKOS.altLabel,
+        SKOS.hiddenLabel,
+        RDFS.label,
+        SCHEMA.alternateName,
+    ]
+
+    # Prédicats de liens hiérarchiques/associatifs
+    broader_predicates = [
+        SKOS.broader,
+        SKOS.broaderTransitive,
+        RDFS.subClassOf,
+        DCTERMS.isPartOf,
+        SCHEMA.isPartOf,
+    ]
+    narrower_predicates = [
+        SKOS.narrower,
+        SKOS.narrowerTransitive,
+    ]
+    related_predicates = [
+        SKOS.related,
+        SKOS.relatedMatch,
+        SKOS.closeMatch,
+        SKOS.exactMatch,
+        SKOS.broadMatch,
+        SKOS.narrowMatch,
+        RDFS.seeAlso,
+        OWL.sameAs,
+        SCHEMA.sameAs,
+    ]
+
+    # Déterminer quelles ressources sont des "concepts" à indexer
+    # On indexe toute ressource qui a au moins un libellé, une définition, ou un type connu
+    concept_types = {
+        SKOS.Concept,
+        SKOS.Collection,
+        RDFS.Resource,
+        RDFS.Class,
+        OWL.Class,
+        OWL.NamedIndividual,
+        SCHEMA.DefinedTerm,
+    }
+
+    candidates = set()
+    for s in g.subjects():
+        if isinstance(s, URIRef) or isinstance(s, str):
+            candidates.add(s)
+
+    # Filtrer : garder les ressources avec au moins un libellé ou une définition, ou un type concept
+    resources_to_index = []
+    for r in candidates:
+        has_type = False
+        for t in g.objects(r, RDF.type):
+            if t in concept_types:
+                has_type = True
+                break
+
+        has_label = any(_rdf_list_values(g, r, pred) for pred in label_predicates)
+        has_definition = any(_rdf_list_values(g, r, pred) for pred in definition_predicates)
+
+        if has_type or has_label or has_definition:
+            resources_to_index.append(r)
+
+    # Supprimer les ressources qui sont seulement des blank nodes or namespaces
+    resources_to_index = [r for r in resources_to_index if isinstance(r, URIRef)]
+
+    # Si aucune ressource avec type/libellé/définition, indexer toutes les URI
+    if not resources_to_index:
+        resources_to_index = [r for r in candidates if isinstance(r, URIRef)]
+
+    chunks = []
+    for idx, concept in enumerate(resources_to_index):
+        # Libellé principal : prendre le premier trouvé
+        pref = ""
+        for pred in label_predicates:
+            labels = _rdf_list_values(g, concept, pred)
+            if labels:
+                pref = labels[0]
+                break
+
+        # Définition principale
+        definition = ""
+        for pred in definition_predicates:
+            defs = _rdf_list_values(g, concept, pred)
+            if defs:
+                definition = defs[0]
+                break
+
+        # Synonymes / labels alternatifs
+        synonyms = []
+        seen_synonyms = set()
+        for pred in synonym_predicates:
+            for val in _rdf_list_values(g, concept, pred):
+                if val != pref and val not in seen_synonyms:
+                    seen_synonyms.add(val)
+                    synonyms.append(val)
+
+        # Notes et autres descriptions
+        notes = []
+        for pred in [SKOS.note, SKOS.scopeNote, SKOS.example, SKOS.historyNote, SKOS.editorialNote, SKOS.changeNote]:
+            notes.extend(_rdf_list_values(g, concept, pred))
+
+        # Liens
+        broaders = []
+        seen_links = set()
+        for pred in broader_predicates:
+            for uri in _rdf_uri_list(g, concept, pred):
+                if uri not in seen_links:
+                    seen_links.add(uri)
+                    broaders.append(uri)
+
+        narrowers = []
+        seen_links = set()
+        for pred in narrower_predicates:
+            for uri in _rdf_uri_list(g, concept, pred):
+                if uri not in seen_links:
+                    seen_links.add(uri)
+                    narrowers.append(uri)
+
+        relateds = []
+        seen_links = set()
+        for pred in related_predicates:
+            for uri in _rdf_uri_list(g, concept, pred):
+                if uri not in seen_links:
+                    seen_links.add(uri)
+                    relateds.append(uri)
+
+        # Types
+        types = _rdf_uri_list(g, concept, RDF.type)
+
+        # Autres propriétés littérales intéressantes
+        extra_lines = []
+        interesting_preds = set()
+        for p, o in g.predicate_objects(concept):
+            if isinstance(o, Literal):
+                pred_str = _rdf_expand_namespace(g, p)
+                if pred_str not in interesting_preds:
+                    interesting_preds.add(pred_str)
+                    vals = _rdf_list_values(g, concept, p)
+                    if vals and p not in label_predicates and p not in definition_predicates and p not in synonym_predicates:
+                        short_name = pred_str.split("/")[-1].split("#")[-1]
+                        extra_lines.append(f"{short_name} : {' | '.join(vals)}")
+
+        lines = [f"Concept : {pref}"] if pref else [f"Concept URI : {concept}"]
+        if types:
+            lines.append(f"Types : {', '.join(t.split('/')[-1].split('#')[-1] for t in types)}")
+        if synonyms:
+            lines.append(f"Synonymes : {', '.join(synonyms)}")
+        if definition:
+            lines.append(f"Définition : {definition}")
+        if notes:
+            lines.append(f"Notes : {' | '.join(notes)}")
+        if broaders:
+            lines.append(f"Concepts plus généraux : {', '.join(broaders)}")
+        if narrowers:
+            lines.append(f"Concepts plus spécifiques : {', '.join(narrowers)}")
+        if relateds:
+            lines.append(f"Concepts liés : {', '.join(relateds)}")
+        lines.extend(extra_lines)
+
+        body = "\n".join(lines)
+        if not body.strip():
+            continue
+
+        chunks.append({
+            "text": body,
+            "doctype": "rdf_concept",
+            "concept_uri": str(concept),
+            "term": pref,
+            "definition": definition,
+            "synonyms": synonyms,
+            "broader": broaders,
+            "narrower": narrowers,
+            "related": relateds,
+            "rdf_types": types,
+            "chunk_index": idx,
+        })
+
+    return chunks
+
+
+def chunk_json_structured(text: str) -> list[dict[str, Any]]:
+    """
+    Parse un JSON structuré (liste de concepts, glossaire JSON-LD-like).
+    Retourne un chunk par entrée si possible.
+    """
+    try:
+        data = json.loads(text)
+    except Exception:
+        return []
+
+    chunks = []
+    if isinstance(data, list):
+        for idx, item in enumerate(data):
+            if isinstance(item, dict):
+                body = _format_dict(item)
+                chunks.append({
+                    "text": body,
+                    "doctype": "json_entry",
+                    "term": _first_value(item, ["terme", "term", "label", "name", "title", "prefLabel", "concept"]),
+                    "definition": _first_value(item, ["définition", "definition", "description", "definitionText", "meaning"]),
+                    "chunk_index": idx,
+                })
+    elif isinstance(data, dict):
+        # Essayer de trouver une liste de concepts
+        for key, value in data.items():
+            if isinstance(value, list) and value and isinstance(value[0], dict):
+                for idx, item in enumerate(value):
+                    body = _format_dict(item)
+                    chunks.append({
+                        "text": body,
+                        "doctype": "json_entry",
+                        "term": _first_value(item, ["terme", "term", "label", "name", "title", "prefLabel", "concept"]),
+                        "definition": _first_value(item, ["définition", "definition", "description", "definitionText", "meaning"]),
+                        "chunk_index": idx,
+                        "parent_key": key,
+                    })
+                break
+        else:
+            # Sinon un chunk pour tout le document
+            body = _format_dict(data)
+            chunks.append({
+                "text": body,
+                "doctype": "json_entry",
+                "term": _first_value(data, ["title", "name", "label"]),
+                "chunk_index": 0,
+            })
+
+    return chunks
+
+
+def _format_dict(item: dict) -> str:
+    lines = []
+    for k, v in sorted(item.items()) if isinstance(item, dict) else []:
+        if isinstance(v, (dict, list)):
+            v = json.dumps(v, ensure_ascii=False)
+        lines.append(f"{k} : {v}")
+    return "\n".join(lines)
+
+
+def _first_value(item: dict, keys: Iterable[str]) -> str:
+    for k in keys:
+        if k in item and item[k]:
+            return str(item[k]).strip()
+    return ""
+
+
+def chunk_yaml_structured(text: str) -> list[dict[str, Any]]:
+    """Parse un YAML structuré et chunk par entrée de premier niveau."""
+    if yaml is None:
+        return []
+    try:
+        data = yaml.safe_load(text)
+    except Exception:
+        return []
+    return chunk_json_structured(json.dumps(data, ensure_ascii=False))
+
+
+def chunk_html_glossary(text: str) -> list[dict[str, Any]]:
+    """
+    Extrait un glossaire web structuré : liste de termes/définitions.
+    Fallback : chunk par titres.
+    """
+    if BeautifulSoup is None:
+        return []
+
+    soup = BeautifulSoup(text, "html.parser")
+    # Nettoyage
+    for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
+        tag.decompose()
+
+    chunks = []
+
+    # Stratégie 1 : définitions HTML (dt/dd)
+    dts = soup.find_all("dt")
+    if dts:
+        for idx, dt in enumerate(dts):
+            term = dt.get_text(" ", strip=True)
+            dd = dt.find_next("dd")
+            definition = dd.get_text(" ", strip=True) if dd else ""
+            body = f"Terme : {term}\nDéfinition : {definition}".strip()
+            chunks.append({
+                "text": body,
+                "doctype": "glossary_entry",
+                "term": term,
+                "definition": definition,
+                "chunk_index": idx,
+            })
+        return chunks
+
+    # Stratégie 2 : titres h2/h3 suivis de paragraphes
+    sections = []
+    current_title = ""
+    current_body = []
+
+    for elem in soup.find_all(["h1", "h2", "h3", "h4", "p", "li"]):
+        if elem.name in ("h1", "h2", "h3", "h4"):
+            if current_body:
+                sections.append((current_title, "\n".join(current_body)))
+            current_title = elem.get_text(" ", strip=True)
+            current_body = []
+        else:
+            txt = elem.get_text(" ", strip=True)
+            if txt:
+                current_body.append(txt)
+    if current_body:
+        sections.append((current_title, "\n".join(current_body)))
+
+    for idx, (title, body) in enumerate(sections):
+        text_chunk = f"{title}\n\n{body}".strip() if title else body
+        if text_chunk:
+            chunks.append({
+                "text": text_chunk,
+                "doctype": "html_section",
+                "section_title": title,
+                "chunk_index": idx,
+            })
+
+    return chunks
+
+
+def chunk_pdf_by_sections(text: str) -> list[dict[str, Any]]:
+    """Chunk un PDF converti en Markdown par titres de sections."""
+    lines = text.splitlines()
+    chunks = []
+    current_title = ""
+    current_level = 0
+    current_body = []
+    idx = 0
+
+    title_re = re.compile(r"^(#{1,4})\s+(.+)$")
+
+    for line in lines:
+        m = title_re.match(line.strip())
+        if m:
+            if current_body:
+                body = "\n".join(current_body).strip()
+                if body:
+                    chunks.append({
+                        "text": f"{current_title}\n\n{body}".strip() if current_title else body,
+                        "doctype": "pdf_section",
+                        "section_title": current_title,
+                        "section_level": current_level,
+                        "chunk_index": idx,
+                    })
+                    idx += 1
+            current_level = len(m.group(1))
+            current_title = m.group(2).strip()
+            current_body = []
+        else:
+            current_body.append(line)
+
+    if current_body:
+        body = "\n".join(current_body).strip()
+        if body:
+            chunks.append({
+                "text": f"{current_title}\n\n{body}".strip() if current_title else body,
+                "doctype": "pdf_section",
+                "section_title": current_title,
+                "section_level": current_level,
+                "chunk_index": idx,
+            })
+
+    return chunks if chunks else [{"text": text, "doctype": "pdf_section", "chunk_index": 0}]
+
+
+def chunk_text_structured(text: str) -> list[dict[str, Any]]:
+    """
+    Détecte la structure d'un texte brut ou Markdown :
+    - articles de loi
+    - sections par titres Markdown
+    - fallback uniforme
+    """
+    # 1. Articles de loi
+    articles = parse_legal_articles(text)
+    if len(articles) > 1 or (len(articles) == 1 and articles[0][0] is not None):
+        chunks = []
+        for idx, (article, content) in enumerate(articles):
+            cited = extract_cited_articles(content)
+            title = f"Article {article}" if article else "Texte sans article"
+            chunks.append({
+                "text": f"{title}\n\n{content}".strip(),
+                "doctype": "legal_article",
+                "article": article,
+                "cited_articles": cited,
+                "chunk_index": idx,
+            })
+        return chunks
+
+    # 2. Sections Markdown
+    md_chunks = chunk_pdf_by_sections(text)
+    if len(md_chunks) > 1:
+        for c in md_chunks:
+            c["doctype"] = "text_section"
+        return md_chunks
+
+    # 3. Fallback uniforme
+    uniform = split_text_uniformly(text)
+    return [
+        {"text": chunk, "doctype": "generic", "chunk_index": i}
+        for i, chunk in enumerate(uniform)
+    ]
+
+
+def chunk_by_type(filepath: Path, text: str, base_document_id: str) -> list[dict[str, Any]]:
+    """
+    Routeur de chunking intelligent : 1 concept = 1 chunk quand possible.
+    """
+    ext = filepath.suffix.lower()
+
+    try:
+        if ext == ".tsv":
+            return chunk_glossary_table(text, delimiter="\t")
+        if ext == ".csv":
+            return chunk_glossary_table(text, delimiter=",")
+        if ext in (".xlsx", ".xls"):
+            return chunk_excel(filepath)
+        if ext in (".rdf", ".ttl", ".jsonld", ".n3", ".nt", ".trig", ".owl"):
+            return chunk_rdf(filepath, text, base_document_id)
+        if ext == ".json":
+            structured = chunk_json_structured(text)
+            return structured if structured else [{"text": chunk, "doctype": "generic", "chunk_index": i} for i, chunk in enumerate(split_text_uniformly(text))]
+        if ext in (".yaml", ".yml"):
+            structured = chunk_yaml_structured(text)
+            return structured if structured else [{"text": chunk, "doctype": "generic", "chunk_index": i} for i, chunk in enumerate(split_text_uniformly(text))]
+        if ext in (".html", ".htm", ".xhtml"):
+            structured = chunk_html_glossary(text)
+            return structured if structured else [{"text": chunk, "doctype": "generic", "chunk_index": i} for i, chunk in enumerate(split_text_uniformly(text))]
+        if ext == ".pdf":
+            return chunk_pdf_by_sections(text)
+        if ext in (".txt", ".md", ".markdown", ".rst", ".adoc"):
+            return chunk_text_structured(text)
+    except Exception as e:
+        print(f"[!] Structured chunking failed for {filepath.name}: {e}. Falling back to uniform chunking.")
+
+    return [{"text": chunk, "doctype": "generic", "chunk_index": i} for i, chunk in enumerate(split_text_uniformly(text))]
 
 
 def read_pdf_document(filepath: Path) -> tuple[str, str]:
@@ -640,6 +1497,38 @@ def setup_collection(capabilities: dict[str, Any]) -> bool:
     )
     print("[✓] Payload index for 'document_id' created.")
 
+    print("[~] Creating payload index for 'doctype'...")
+    client.create_payload_index(
+        collection_name=COLLECTION,
+        field_name="doctype",
+        field_schema=PayloadSchemaType.KEYWORD,
+    )
+    print("[✓] Payload index for 'doctype' created.")
+
+    print("[~] Creating payload index for 'term'...")
+    client.create_payload_index(
+        collection_name=COLLECTION,
+        field_name="term",
+        field_schema=PayloadSchemaType.KEYWORD,
+    )
+    print("[✓] Payload index for 'term' created.")
+
+    print("[~] Creating payload index for 'article'...")
+    client.create_payload_index(
+        collection_name=COLLECTION,
+        field_name="article",
+        field_schema=PayloadSchemaType.KEYWORD,
+    )
+    print("[✓] Payload index for 'article' created.")
+
+    print("[~] Creating payload index for 'concept_uri'...")
+    client.create_payload_index(
+        collection_name=COLLECTION,
+        field_name="concept_uri",
+        field_schema=PayloadSchemaType.KEYWORD,
+    )
+    print("[✓] Payload index for 'concept_uri' created.")
+
     return True
 
 
@@ -899,13 +1788,20 @@ def index_documents():
                 )
 
             document_id = generate_document_id(filepath)
-            chunks = split_text_uniformly(optimized_text)
+            structured_chunks = chunk_by_type(filepath, optimized_text, document_id)
 
-            if not chunks:
+            if not structured_chunks:
                 continue
 
+            # Normaliser en listes de textes + métadonnées
+            chunks = []
+            for c in structured_chunks:
+                if not c.get("text", "").strip():
+                    continue
+                chunks.append(c)
+
             total_chunks += len(chunks)
-            print(f"[~] Chunked {filepath.name} into {len(chunks)} chunks (Tags: {tags})")
+            print(f"[~] Chunked {filepath.name} into {len(chunks)} structured chunks (Tags: {tags})")
 
             # ── Génération du résumé (une fois par document, si non déjà indexé) ──
             chunk0_id = generate_chunk_stable_id(document_id, 0)
@@ -921,9 +1817,13 @@ def index_documents():
                     print(f"[!] No summary generated for '{filepath.name}'")
             # ─────────────────────────────────────────────────────────────────────
 
-            for chunk_index, chunk_text in enumerate(chunks):
+            for chunk_index, chunk_meta in enumerate(chunks):
+                chunk_text = chunk_meta.get("text", "").strip()
+                if not chunk_text:
+                    continue
+
                 payload_extra = {
-                    "doctype": "uniform_chunk",
+                    "doctype": chunk_meta.get("doctype", "generic"),
                     "document_id": document_id,
                     "chunk_index": chunk_index,
                     "chunk_count": len(chunks),
@@ -932,6 +1832,19 @@ def index_documents():
                     "source_extension": filepath.suffix.lower(),
                     "document_name": filepath.stem,
                     "tags": tags,
+                    # Métadonnées optionnelles
+                    "term": chunk_meta.get("term", "") or "",
+                    "definition": chunk_meta.get("definition", "") or "",
+                    "synonyms": chunk_meta.get("synonyms", []) or [],
+                    "article": chunk_meta.get("article", "") or "",
+                    "cited_articles": chunk_meta.get("cited_articles", []) or [],
+                    "concept_uri": chunk_meta.get("concept_uri", "") or "",
+                    "broader": chunk_meta.get("broader", []) or [],
+                    "narrower": chunk_meta.get("narrower", []) or [],
+                    "related": chunk_meta.get("related", []) or [],
+                    "section_title": chunk_meta.get("section_title", "") or "",
+                    "sheet": chunk_meta.get("sheet", "") or "",
+                    "parent_key": chunk_meta.get("parent_key", "") or "",
                 }
 
                 # Chunk 0 : résumé + base64

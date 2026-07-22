@@ -1,4 +1,4 @@
-from typing import List, Any, Tuple
+from typing import List, Any, Dict
 from .retrieve_search_documents import retrieve_search_documents
 
 from qdrant_client.models import (
@@ -27,7 +27,6 @@ AGGREGATION_MAX_WEIGHT: float = float(getattr(cf, "config", {}).get("search", {}
 AGGREGATION_MEAN_WEIGHT: float = float(getattr(cf, "config", {}).get("search", {}).get("aggregation_mean_weight", 0.1) if hasattr(cf, "config") else 0.1)
 HYBRID_DENSE_WEIGHT: float = float(getattr(cf, "config", {}).get("search", {}).get("hybrid_dense_weight", 0.7) if hasattr(cf, "config") else 0.7)
 
-# On conserve également SEARCH_LIMIT pour la fonction retrieve_documents
 SEARCH_LIMIT: int = int(getattr(cf, "config", {}).get("search", {}).get("limit", 3) if hasattr(cf, "config") else 3)
 FULL_DOCUMENT_CHUNK_THRESHOLD: int = int(getattr(cf, "config", {}).get("search", {}).get("full_document_chunk_threshold", 12) if hasattr(cf, "config") else 12)
 SCROLL_LIMIT_PER_DOC: int = int(getattr(cf, "config", {}).get("search", {}).get("scroll_limit_per_doc", 10000) if hasattr(cf, "config") else 10000)
@@ -44,9 +43,11 @@ def _load_document_chunks(document_id: str) -> list[Any]:
             scroll_filter=Filter(must=[FieldCondition(key="document_id", match=MatchValue(value=document_id))]),
             limit=SCROLL_LIMIT_PER_DOC, offset=offset, with_payload=True, with_vectors=False,
         )
-        if not points: break
+        if not points:
+            break
         all_points.extend(points)
-        if offset is None: break
+        if offset is None:
+            break
     return sorted(all_points, key=lambda p: int((p.payload or {}).get("chunk_index", 0)))
 
 
@@ -106,42 +107,100 @@ def _load_best_view_for_document(
     return filename, header + partial_text
 
 
-# =====================================================================
-# PIPELINE 2 : RECHERCHE LLM (Avec reconstruction des documents)
-# =====================================================================
+def _payload_to_chunk_dict(payload: Dict[str, Any], score: float = 0.0) -> Dict[str, Any]:
+    """
+    Normalise un payload Qdrant en dictionnaire de chunk exploitable
+    par l'UI et les outils (resolve_links, compare_concepts).
+    """
+    return {
+        "text": str(payload.get("text", "")),
+        "filename": str(payload.get("filename", "")),
+        "document_name": str(payload.get("document_name", "")),
+        "document_id": str(payload.get("document_id", "")),
+        "chunk_index": int(payload.get("chunk_index", 0)),
+        "chunk_count": int(payload.get("chunk_count", 1)),
+        "source_path": str(payload.get("source_path", "")),
+        "source_extension": str(payload.get("source_extension", "")),
+        "doctype": str(payload.get("doctype", "generic")),
+        "tags": payload.get("tags", []) or [],
+        "term": str(payload.get("term", "")),
+        "definition": str(payload.get("definition", "")),
+        "synonyms": payload.get("synonyms", []) or [],
+        "article": str(payload.get("article", "")),
+        "cited_articles": payload.get("cited_articles", []) or [],
+        "concept_uri": str(payload.get("concept_uri", "")),
+        "broader": payload.get("broader", []) or [],
+        "narrower": payload.get("narrower", []) or [],
+        "related": payload.get("related", []) or [],
+        "section_title": str(payload.get("section_title", "")),
+        "doc_summary": str(payload.get("doc_summary", "")),
+        "score": float(score),
+    }
+
+
 def retrieve_documents(
     search_terms: str,
     limit: int = 10,
     return_full_document: bool = True,
     tags: list = None,
-) -> List[Tuple[str, str, str, Any, float, list]]:
+    document_filter: str = None,
+) -> List[Dict[str, Any]]:
+    """
+    Recherche des documents et retourne une liste de chunks enrichis
+    avec leurs métadonnées (term, article, concept_uri, related, etc.).
+    """
     if limit is None:
         limit = SEARCH_LIMIT
 
     try:
-        search_results = retrieve_search_documents(search_terms, tags=tags, limit=limit)
+        search_results = retrieve_search_documents(
+            search_terms=search_terms,
+            tags=tags,
+            limit=limit,
+            document_filter=document_filter,
+        )
 
         if not search_results:
             return []
 
         is_single_doc = (limit == 1)
-        final_results: List[Tuple[str, str, str, Any, float, list]] = []
+        final_results: List[Dict[str, Any]] = []
 
-        for (filename, best_chunk_text, doc_summary, chunk0_id, score, tags_list, document_id, best_chunk_index) in search_results:
-            _, text = _load_best_view_for_document(
+        for (
+            filename,
+            best_chunk_text,
+            doc_summary,
+            chunk0_id,
+            score,
+            tags_list,
+            document_id,
+            best_chunk_index,
+        ) in search_results:
+            _, reconstructed_text = _load_best_view_for_document(
                 document_id=document_id,
                 best_chunk_index=best_chunk_index,
                 return_full_document=return_full_document,
                 is_single_doc=is_single_doc,
             )
 
-            final_results.append((
-                filename,
-                tags_list,
-                doc_summary,
-                text,
-                score,
-            ))
+            final_results.append({
+                "text": reconstructed_text,
+                "filename": filename,
+                "document_name": filename.replace(".", "_").rsplit("_", 1)[0] if "." in filename else filename,
+                "document_id": document_id,
+                "tags": tags_list,
+                "doc_summary": doc_summary,
+                "score": float(score),
+                "best_chunk_index": int(best_chunk_index),
+                # Métadonnées détaillées du meilleur chunk
+                "chunk": _payload_to_chunk_dict({
+                    "text": best_chunk_text,
+                    "filename": filename,
+                    "document_name": filename.replace(".", "_").rsplit("_", 1)[0] if "." in filename else filename,
+                    "document_id": document_id,
+                    "chunk_index": best_chunk_index,
+                }, score=score),
+            })
 
         return final_results
 
@@ -154,6 +213,8 @@ def retrieve_documents(
 
 if __name__ == "__main__":
     query = input("Query: ").strip()
-    results = retrieve_search_documents(query, limit=8)
-    for i, (filename, text, summary, chunk0_id, score, tags) in enumerate(results, start=1):
-        print(f"[{i}] {filename} | chunk_0_id={chunk0_id} | score={score:.4f} | tags={tags}")
+    results = retrieve_documents(query, limit=8)
+    for i, r in enumerate(results, start=1):
+        print(f"[{i}] {r['filename']} | score={r['score']:.4f} | tags={r['tags']}")
+        print(r["text"][:500])
+        print("-" * 50)

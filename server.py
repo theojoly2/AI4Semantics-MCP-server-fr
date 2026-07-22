@@ -12,14 +12,7 @@ from typing import List, Optional, Any
 from fastmcp import FastMCP
 from fastmcp.tools import Tool
 from fastmcp.server.event_store import EventStore
-import resources
 import tools
-
-# Importation de l'outil de téléchargement de fichier (pour l'UI)
-try:
-    from file_tool import get_document_file
-except ImportError:
-    pass
 
 project_dir = Path(__file__).resolve().parent
 env_path = project_dir / ".env"
@@ -33,7 +26,7 @@ load_dotenv(dotenv_path=env_path)
 ai_thread_pool = ThreadPoolExecutor(max_workers=2)
 
 mcp = FastMCP(
-    name="DataModellingServer",
+    name="GlossaryAI",
 )
 
 
@@ -42,10 +35,11 @@ mcp = FastMCP(
 # Transforme la fonction lourde en tâche asynchrone pour ne pas bloquer le serveur
 # ====================================================================
 async def async_retrieve_documents(
-    search_terms: str, 
-    limit: int = 10, 
-    return_full_document: bool = True, 
-    tags: Optional[List[str]] = None
+    search_terms: str,
+    limit: int = 10,
+    return_full_document: bool = True,
+    tags: Optional[List[str]] = None,
+    document_filter: Optional[str] = None,
 ) -> list:
     """
     Recherche des documents ou standards dans la base de connaissances.
@@ -58,13 +52,49 @@ async def async_retrieve_documents(
         search_terms=search_terms,
         limit=limit,
         return_full_document=return_full_document,
-        tags=tags
+        tags=tags,
+        document_filter=document_filter,
     )
 
     # Exécution dans le thread pool
     results = await loop.run_in_executor(ai_thread_pool, func)
 
     return results
+
+
+async def async_resolve_links(
+    chunks: List[dict],
+    max_depth: int = 1,
+    visited: Optional[List[str]] = None,
+) -> List[dict]:
+    """
+    Détecte les liens juridiques et conceptuels dans les chunks et remonte
+    les chunks liés (1 saut de profondeur par défaut, anti-boucle).
+    """
+    loop = asyncio.get_running_loop()
+    func = functools.partial(
+        tools.resolve_links,
+        chunks=chunks,
+        max_depth=max_depth,
+        visited=visited,
+    )
+    return await loop.run_in_executor(ai_thread_pool, func)
+
+
+async def async_compare_concepts(
+    terms: List[str],
+    limit: int = 5,
+) -> dict:
+    """
+    Compare plusieurs termes et propose une définition convergente avec sources.
+    """
+    loop = asyncio.get_running_loop()
+    func = functools.partial(
+        tools.compare_concepts,
+        terms=terms,
+        limit=limit,
+    )
+    return await loop.run_in_executor(ai_thread_pool, func)
 
 
 # ====================================================================
@@ -80,71 +110,8 @@ mcp.add_tool(
 
 mcp.add_tool(
     Tool.from_function(
-        tools.get_style_guide,
-        name="get_style_guide",
-    )
-)
-
-mcp.add_tool(
-    Tool.from_function(
         async_retrieve_documents,
         name="retrieve_documents",
-    )
-)
-
-mcp.add_tool(
-    Tool.from_function(
-        tools.upload_model,
-        name="upload_model",
-    )
-)
-
-mcp.add_tool(
-    Tool.from_function(
-        tools.add_class,
-        name="add_class",
-    )
-)
-
-mcp.add_tool(
-    Tool.from_function(
-        tools.add_attribute,
-        name="add_attribute",
-    )
-)
-
-mcp.add_tool(
-    Tool.from_function(
-        tools.add_connector,
-        name="add_connector",
-    )
-)
-
-mcp.add_tool(
-    Tool.from_function(
-        tools.metadata_checker,
-        name="metadata_checker",
-    )
-)
-
-mcp.add_tool(
-    Tool.from_function(
-        tools.reuse_check,
-        name="reuse_check",
-    )
-)
-
-mcp.add_tool(
-    Tool.from_function(
-        tools.style_guide_check,
-        name="style_guide_check",
-    )
-)
-
-mcp.add_tool(
-    Tool.from_function(
-        tools.validator_check,
-        name="validator_check",
     )
 )
 
@@ -155,22 +122,18 @@ mcp.add_tool(
     )
 )
 
-# ====================================================================
-# ENREGISTREMENT DES RESSOURCES
-# ====================================================================
-
-mcp.resource(
-    "resource://model/{user}/{session_name}",
-    mime_type="application/json"
-)(
-    resources.get_model
+mcp.add_tool(
+    Tool.from_function(
+        async_resolve_links,
+        name="resolve_links",
+    )
 )
 
-mcp.resource(
-    "resource://Style_Guide}",
-    mime_type="text/plain"
-)(
-    resources.get_style_guide
+mcp.add_tool(
+    Tool.from_function(
+        async_compare_concepts,
+        name="compare_concepts",
+    )
 )
 
 

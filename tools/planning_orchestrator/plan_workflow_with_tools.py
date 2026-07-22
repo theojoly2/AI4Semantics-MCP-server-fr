@@ -2,7 +2,6 @@ from __future__ import annotations
 import json, re
 from typing import Any
 from fastmcp import Context, Client
-from resources.semantic_model.utils import get_model
 from .prompts import system_prompt_orchestrator
 
 # -------- Planner tool that can CALL planning tools via an inner loop ----------
@@ -37,7 +36,7 @@ async def plan_workflow_with_tools(
     except Exception as e:
         print("\n[ERROR] listing tools failed:\n", str(e))
 
-    planning_tools = [t for t in all_tools if t.name in ("get_style_guide",)]
+    planning_tools = []  # No planning-only tools for GlossaryAI
     executor_tools = (
         [
             {"name": t.name, "description": t.description}
@@ -55,22 +54,13 @@ async def plan_workflow_with_tools(
     planning_allow = {t["name"] for t in planning_tools_visible}
 
     # 2) Build system + initial user messages for the planner agent
-    try: 
-        model = get_model(user, name) if user and name else {}
-        if model:
-            format = "ttl/owl" if "ttl" in model.keys() else "xmi/uml"
-    except Exception as e:
-        print("\n[ERROR] get_model failed:\n", str(e))
-        model = {}
-
     user_block = {
         "user_question": user_question,
         "user_info": {
             "user": user if user else "anonymous",
             "name": name if name else "default",
-            # Potentially useful metadata about the data model
-            "provided_data_model": "yes" if model else "no",
-            "data_model_format": format if model else "unknown",
+            "provided_data_model": "no",
+            "data_model_format": "unknown",
             },
         "observations": observations or [],
         "planning_tools_you_can_call": planning_tools_visible,
@@ -182,9 +172,9 @@ plan_workflow_with_tools.__doc__ = f"""
 
     Args:
         user (str, optional):
-            Identifier passed to `get_model` to locate the model. Defaults to "".
+            User identifier. Defaults to "".
         name (str, optional):
-            Model name passed to `get_model` to locate the model. Defaults to "".
+            Session name. Defaults to "".
         user_question (str):
             The user's original question to be answered by the plan.
 
