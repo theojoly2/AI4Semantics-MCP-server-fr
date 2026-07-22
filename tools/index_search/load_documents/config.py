@@ -1,10 +1,11 @@
 from pathlib import Path
 from os import getenv, environ
-
-PROJECT_ROOT = Path(__file__).resolve().parent
-environ["HF_HOME"] = str(PROJECT_ROOT / ".cache_hf")
-
 from typing import Any, List, Tuple, Union
+from abc import ABC, abstractmethod
+import threading
+import time
+
+import requests
 
 from yaml import safe_load
 from qdrant_client import QdrantClient
@@ -14,7 +15,6 @@ import torch
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
-    BitsAndBytesConfig,
 )
 
 from optimum.onnxruntime import ORTModelForSequenceClassification
@@ -25,6 +25,9 @@ from filelock import FileLock
 
 load_dotenv()
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+environ["HF_HOME"] = str(PROJECT_ROOT / ".cache_hf")
+
 CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
 
 with CONFIG_PATH.open("r", encoding="utf-8") as f:
@@ -32,9 +35,32 @@ with CONFIG_PATH.open("r", encoding="utf-8") as f:
 
 
 # =========================================================
-# RERANKER
+# BASE RERANKER INTERFACE
 # =========================================================
-class HFTransformerReranker:
+class BaseReranker(ABC):
+    """Interface commune pour tous les rerankers (local ou API)."""
+
+    @abstractmethod
+    def compute_score(self, sentence_pairs, normalize=False, max_length=512):
+        """
+        sentence_pairs: liste de paires [query, document] ou tuple unique.
+        Retourne une liste de scores (ou un score unique si tuple en entrée).
+        """
+        raise NotImplementedError
+
+    def get_batch_settings(self) -> dict[str, Any]:
+        """
+        Retourne les paramètres de batch pour ce backend.
+        - batch_size: taille du lot
+        - parallel: True si le backend supporte le parallélisme
+        """
+        return {"batch_size": 24, "parallel": True}
+
+
+# =========================================================
+# LOCAL RERANKER
+# =========================================================
+class LocalReranker(BaseReranker):
     """
     GPU  → FP16
     CPU  → ONNX INT8 (Q8 auto export + quantization)
@@ -60,7 +86,7 @@ class HFTransformerReranker:
     def _load_gpu(self):
         model = AutoModelForSequenceClassification.from_pretrained(
             self.model_name,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
         )
         return model.to(self.device)
 
@@ -133,6 +159,9 @@ class HFTransformerReranker:
     # =====================================================
     # SCORE
     # =====================================================
+    def get_batch_settings(self) -> dict[str, Any]:
+        return {"batch_size": 24, "parallel": True}
+
     @torch.inference_mode()
     def compute_score(self, sentence_pairs, normalize=False, max_length=512):
         if isinstance(sentence_pairs, tuple):
@@ -168,6 +197,182 @@ class HFTransformerReranker:
             return scores[0]
 
         return scores
+
+
+# =========================================================
+# API RERANKER (Albert /v1/rerank)
+# =========================================================
+class ApiReranker(BaseReranker):
+    """
+    Reranker via API Albert : https://albert.api.etalab.gouv.fr/v1/rerank
+    Format attendu: {query, documents, model, top_n}
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        api_key: str | None = None,
+        timeout: int = 30,
+        retry_attempts: int = 1,
+        retry_delay: float = 1.0,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
+        self.timeout = timeout
+        self.retry_attempts = retry_attempts
+        self.retry_delay = retry_delay
+        self._url = f"{self.base_url}/v1/rerank"
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    def get_batch_settings(self) -> dict[str, Any]:
+        return {"batch_size": 100, "parallel": False}
+
+    def compute_score(self, sentence_pairs, normalize=False, max_length=512):
+        """
+        Albert /v1/rerank attend une query unique + une liste de documents.
+        On reconstruit ces champs à partir des paires [query, doc].
+        """
+        if isinstance(sentence_pairs, tuple):
+            pairs = [sentence_pairs]
+        else:
+            pairs = list(sentence_pairs)
+
+        if not pairs:
+            return []
+
+        queries = [q for q, _ in pairs]
+        documents = [d for _, d in pairs]
+
+        # Vérification: toutes les queries doivent être identiques
+        query = queries[0]
+        if any(q != query for q in queries):
+            raise ValueError("ApiReranker requires all pairs to share the same query.")
+
+        payload = {
+            "query": query,
+            "documents": documents,
+            "model": self.model,
+            "top_n": None,  # Récupérer tous les scores
+        }
+
+        last_exception: Exception | None = None
+        attempts = self.retry_attempts + 1
+
+        for attempt in range(attempts):
+            try:
+                response = requests.post(
+                    self._url,
+                    headers=self._headers(),
+                    json=payload,
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                results = data.get("results", [])
+                scores = [0.0] * len(documents)
+
+                for item in results:
+                    idx = item.get("index")
+                    score = item.get("relevance_score")
+                    if isinstance(idx, int) and 0 <= idx < len(documents) and score is not None:
+                        scores[idx] = float(score)
+
+                if isinstance(sentence_pairs, tuple):
+                    return scores[0]
+                return scores
+
+            except requests.exceptions.RequestException as e:
+                last_exception = e
+                status_code = getattr(e.response, "status_code", None)
+
+                # Retries limités aux erreurs transitoires
+                if status_code not in (429, 503) and not isinstance(
+                    e, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)
+                ):
+                    break
+
+                if attempt < self.retry_attempts:
+                    print(f"⚠ Albert rerank API transient error ({status_code}), retrying in {self.retry_delay}s... (attempt {attempt + 1}/{attempts})")
+                    time.sleep(self.retry_delay)
+                    continue
+
+                break
+
+        # Tous les retries épuisés ou erreur non transitoire
+        raise AlbertApiError(f"Albert rerank API call failed: {last_exception}") from last_exception
+
+
+class AlbertApiError(Exception):
+    """Exception levée lors d'un échec d'appel à l'API Albert."""
+    pass
+
+
+# =========================================================
+# RERANKER ROUTER (API first, fallback local)
+# =========================================================
+class RerankerRouter(BaseReranker):
+    """
+    Tente d'abord l'API Albert.
+    En cas d'erreur, fallback immédiat vers LocalReranker.
+    Après N erreurs consécutives, l'API est désactivée pour la session.
+    """
+
+    def __init__(
+        self,
+        api_reranker: ApiReranker,
+        local_reranker: LocalReranker,
+        max_consecutive_errors: int = 3,
+    ):
+        self.api_reranker = api_reranker
+        self.local_reranker = local_reranker
+        self.max_consecutive_errors = max(1, max_consecutive_errors)
+        self._api_enabled = True
+        self._consecutive_errors = 0
+        self._lock = threading.Lock()
+
+    def get_batch_settings(self) -> dict[str, Any]:
+        return self.api_reranker.get_batch_settings()
+
+    def compute_score(self, sentence_pairs, normalize=False, max_length=512):
+        # Si API désactivée, on passe directement en local
+        with self._lock:
+            api_enabled = self._api_enabled
+
+        if api_enabled:
+            try:
+                scores = self.api_reranker.compute_score(
+                    sentence_pairs, normalize=normalize, max_length=max_length
+                )
+                with self._lock:
+                    self._consecutive_errors = 0
+                return scores
+            except AlbertApiError as e:
+                with self._lock:
+                    self._consecutive_errors += 1
+                    current = self._consecutive_errors
+                    if current >= self.max_consecutive_errors:
+                        self._api_enabled = False
+                        print(f"🔴 Albert API disabled after {current} consecutive errors. Switching to local reranker permanently.")
+                    else:
+                        print(f"🟠 Albert API error ({current}/{self.max_consecutive_errors}), falling back to local reranker for this batch.")
+
+                # Fallback local pour ce batch
+                return self.local_reranker.compute_score(
+                    sentence_pairs, normalize=normalize, max_length=max_length
+                )
+
+        # Mode local
+        return self.local_reranker.compute_score(
+            sentence_pairs, normalize=normalize, max_length=max_length
+        )
 
 
 # =========================================================
@@ -212,13 +417,55 @@ def _load_embedding_model():
 # =========================================================
 # RERANKER LOADER
 # =========================================================
-def _load_reranker_model():
+def _load_reranker_model() -> BaseReranker:
+    """
+    Charge le reranker.
+    Priorité à l'API Albert si configurée et activée.
+    Sinon, fallback sur le modèle local.
+    """
     model_reranker = config["model"]["reranker"]
+    local_reranker = LocalReranker(model_name=model_reranker)
 
-    reranker = HFTransformerReranker(model_name=model_reranker)
+    api_cfg = config.get("reranker_api", {})
+    enabled = api_cfg.get("enabled", False)
+    base_url = api_cfg.get("base_url", "").strip()
+    api_model = api_cfg.get("model", "").strip()
+    api_key_env = api_cfg.get("api_key_env", "")
+    timeout = int(api_cfg.get("timeout", 30))
+    retry_attempts = int(api_cfg.get("retry_attempts", 1))
+    retry_delay = float(api_cfg.get("retry_delay", 1.0))
+    max_consecutive_errors = int(api_cfg.get("max_consecutive_errors", 3))
 
-    print(f"✓ Loaded reranker: {model_reranker}")
-    return reranker
+    api_key = None
+    if api_key_env:
+        api_key = getenv(api_key_env)
+        if api_key:
+            api_key = api_key.strip()
+        if api_key == "":
+            api_key = None
+
+    if enabled and base_url and api_model:
+        try:
+            api_reranker = ApiReranker(
+                base_url=base_url,
+                model=api_model,
+                api_key=api_key,
+                timeout=timeout,
+                retry_attempts=retry_attempts,
+                retry_delay=retry_delay,
+            )
+            print(f"✓ Configured Albert API reranker: {api_model} ({base_url})")
+            return RerankerRouter(
+                api_reranker=api_reranker,
+                local_reranker=local_reranker,
+                max_consecutive_errors=max_consecutive_errors,
+            )
+        except Exception as e:
+            print(f"⚠ Failed to initialize Albert API reranker: {e}. Using local reranker.")
+            return local_reranker
+
+    print(f"✓ Loaded local reranker: {model_reranker}")
+    return local_reranker
 
 
 # =========================================================

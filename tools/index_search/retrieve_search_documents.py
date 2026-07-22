@@ -119,13 +119,27 @@ def _rerank_batch(batch):
     return scores
 
 
-def parallel_rerank(pairs, batch_size=24):
-    """Orchestre le reranking en parallèle sur tous les cœurs disponibles"""
+def parallel_rerank(pairs, batch_size: int | None = None):
+    """
+    Orchestre le reranking selon les capacités du backend actif:
+    - Local  : batch de 24, parallélisme sur les cœurs disponibles.
+    - API    : batch de 100, exécution séquentielle.
+    """
+    if not pairs:
+        return []
+
+    settings = reranker.get_batch_settings()
+    batch_size = batch_size or settings.get("batch_size", 24)
+    parallel = settings.get("parallel", True)
+
     batches = [pairs[i:i + batch_size] for i in range(0, len(pairs), batch_size)]
     all_scores = []
 
-    with ThreadPoolExecutor(max_workers=OPTIMAL_THREADS) as ex:
-        results = list(ex.map(_rerank_batch, batches))
+    if parallel and len(batches) > 1:
+        with ThreadPoolExecutor(max_workers=OPTIMAL_THREADS) as ex:
+            results = list(ex.map(_rerank_batch, batches))
+    else:
+        results = [_rerank_batch(batch) for batch in batches]
 
     for r in results:
         all_scores.extend(r)
@@ -351,7 +365,7 @@ def retrieve_search_documents(
             chunk_pairs.append([search_terms, enriched_chunk])
 
         if chunk_pairs:
-            chunk_scores = parallel_rerank(chunk_pairs, batch_size=24)
+            chunk_scores = parallel_rerank(chunk_pairs)
             for i, doc in enumerate(candidate_docs):
                 doc["rerank_score"] = float(chunk_scores[i]) if i < len(chunk_scores) else 0.0
             candidate_docs.sort(key=lambda x: x["rerank_score"], reverse=True)
@@ -369,7 +383,7 @@ def retrieve_search_documents(
             summary_pairs.append([search_terms, enriched_summary])
 
         if summary_pairs:
-            summary_scores = parallel_rerank(summary_pairs, batch_size=24)
+            summary_scores = parallel_rerank(summary_pairs)
             for i, doc in enumerate(finalists):
                 if i < len(summary_scores):
                     doc["rerank_score"] = (0.5 * doc["rerank_score"]) + (0.5 * float(summary_scores[i]))

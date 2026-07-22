@@ -6,7 +6,7 @@ qdrant:
   api_key: "QDRANT_API_KEY"
 
 collection:
-  name: "documents"
+  name: "documents_v2"
 
 model:
   embedding: "BAAI/bge-m3"
@@ -15,6 +15,17 @@ model:
 indexing:
   batch_size: 5
   documents_path: "documents"
+
+reranker_api:
+  enabled: true
+  base_url: "https://albert.api.etalab.gouv.fr"
+  api_key_env: "ALBERT_API_KEY"
+  model: "BAAI/bge-reranker-v2-m3"
+  timeout: 30
+  retry_attempts: 1
+  retry_delay: 1.0
+  max_consecutive_errors: 3
+  max_batch_size: 100
 
 search:
   limit: 3
