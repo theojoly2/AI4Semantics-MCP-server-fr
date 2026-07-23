@@ -260,38 +260,33 @@ def _compute_document_aggregated_score(scores: list[float], top_k: int = AGGREGA
     return ((max_weight / weight_sum) * best_score) + ((mean_weight / weight_sum) * mean_top_score)
 
 
-def _group_best_chunk_per_document(points: list[Any]) -> list[dict[str, Any]]:
-    grouped: Dict[str, dict[str, Any]] = {}
-    for rank, point in enumerate(points):
+def _group_best_chunks_per_document(points: list[Any]) -> list[dict[str, Any]]:
+    """
+    Keep the top N chunks per document as separate candidates so a single
+    document can contribute multiple results.
+    """
+    grouped: Dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for point in points:
         payload = point.payload or {}
         score = float(getattr(point, "score", 0.0) or 0.0)
-        document_id = str(payload.get("document_id") or payload.get("filename") or f"doc_{rank}")
+        document_id = str(payload.get("document_id") or payload.get("filename") or f"doc_{point.id}")
 
-        current = grouped.get(document_id)
-        if current is None:
-            grouped[document_id] = {
-                "document_id": document_id,
-                "filename": str(payload.get("filename") or document_id),
-                "scores": [score],
-                "best_score": score,
-                "best_chunk_index": int(payload.get("chunk_index", 0)),
-                "best_chunk_text": str(payload.get("text", "")),
-            }
-            continue
+        grouped[document_id].append({
+            "document_id": document_id,
+            "filename": str(payload.get("filename") or document_id),
+            "best_chunk_index": int(payload.get("chunk_index", 0)),
+            "best_chunk_text": str(payload.get("text", "")),
+            "initial_score": score,
+        })
 
-        current["scores"].append(score)
-        if score > current["best_score"]:
-            current["best_score"] = score
-            current["best_chunk_index"] = int(payload.get("chunk_index", 0))
-            current["best_chunk_text"] = str(payload.get("text", ""))
+    # Flatten and sort by initial score; cap per document at MAX_CHUNKS_PER_DOCUMENT
+    flattened: list[dict[str, Any]] = []
+    for document_id, doc_points in grouped.items():
+        doc_points.sort(key=lambda x: x["initial_score"], reverse=True)
+        for doc_point in doc_points[:MAX_CHUNKS_PER_DOCUMENT]:
+            flattened.append(doc_point)
 
-    aggregated_results: list[dict[str, Any]] = []
-    for doc in grouped.values():
-        doc["aggregated_score"] = _compute_document_aggregated_score(
-            scores=doc["scores"], top_k=AGGREGATION_TOP_K, max_weight=AGGREGATION_MAX_WEIGHT, mean_weight=AGGREGATION_MEAN_WEIGHT,
-        )
-        aggregated_results.append(doc)
-    return sorted(aggregated_results, key=lambda x: (x["aggregated_score"], x["best_score"]), reverse=True)
+    return sorted(flattened, key=lambda x: x["initial_score"], reverse=True)
 
 
 def _resolve_chunk0_metadata_batch(document_ids: list[str]) -> dict[str, dict[str, Any]]:
@@ -362,18 +357,16 @@ def retrieve_search_documents(
                 t = payload.get("tags", [])
                 doc_tags_map[doc_id] = [t] if isinstance(t, str) else list(t)
 
-        points = _limit_chunks_per_document(points, MAX_CHUNKS_PER_DOCUMENT)
-        grouped_docs = _group_best_chunk_per_document(points)
+        grouped_docs = _group_best_chunks_per_document(points)
 
         candidate_docs = grouped_docs[:RERANK_POOL_SIZE]
 
-        doc_ids_needed = [doc["document_id"] for doc in candidate_docs]
+        doc_ids_needed = list({doc["document_id"] for doc in candidate_docs})
         chunk0_metadata_map = _resolve_chunk0_metadata_batch(doc_ids_needed)
 
         for doc in candidate_docs:
             chunk0_info = chunk0_metadata_map.get(doc["document_id"], {})
             doc["chunk0_id"] = chunk0_info.get("id")
-            doc["doc_summary"] = chunk0_info.get("doc_summary", "")
 
         # --- ÉTAPE 1 : RERANKING DES CHUNKS EN PARALLÈLE ---
         chunk_pairs = []
@@ -388,34 +381,11 @@ def retrieve_search_documents(
                 doc["rerank_score"] = float(chunk_scores[i]) if i < len(chunk_scores) else 0.0
             candidate_docs.sort(key=lambda x: x["rerank_score"], reverse=True)
 
-        # --- ÉTAPE 2 : RERANKING HYBRIDE DES RÉSUMÉS EN PARALLÈLE ---
-        top_n = min(30, len(candidate_docs))
-        finalists = candidate_docs[:top_n]
-        rest = candidate_docs[top_n:]
-
-        summary_pairs = []
-        for doc in finalists:
-            tags_str = ", ".join(doc_tags_map.get(doc["document_id"], [])) or "Inconnue"
-            summary = str(doc.get("doc_summary", "")).strip() or str(doc.get("best_chunk_text", ""))
-            enriched_summary = f"Source : {tags_str}\nFichier : {doc.get('filename', '')}\nRésumé : {summary[:1024]}"
-            summary_pairs.append([search_terms, enriched_summary])
-
-        if summary_pairs:
-            summary_scores = parallel_rerank(summary_pairs)
-            for i, doc in enumerate(finalists):
-                if i < len(summary_scores):
-                    doc["rerank_score"] = (0.5 * doc["rerank_score"]) + (0.5 * float(summary_scores[i]))
-            finalists.sort(key=lambda x: x["rerank_score"], reverse=True)
-
-        # Reconstruction complète + tri global final
-        candidate_docs = finalists + rest
-        candidate_docs.sort(key=lambda x: x["rerank_score"], reverse=True)
-
         final_results = [
             (
                 doc["filename"],                                    # [0]
                 doc.get("best_chunk_text", ""),                     # [1]
-                doc.get("doc_summary", "") or "Aucun résumé",       # [2]
+                "",                                                 # [2] no summary
                 doc.get("chunk0_id"),                               # [3]
                 float(doc.get("rerank_score", 0.0)),                # [4]
                 doc_tags_map.get(doc["document_id"], []),           # [5]

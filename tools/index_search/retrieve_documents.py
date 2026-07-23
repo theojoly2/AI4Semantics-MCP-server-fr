@@ -74,37 +74,13 @@ def _load_best_view_for_document(
         return document_id, ""
 
     filename = str((ordered[0].payload or {}).get("filename", document_id))
-    total_chunks = len(ordered)
 
-    if not return_full_document:
-        for p in ordered:
-            payload = p.payload or {}
-            if int(payload.get("chunk_index", 0)) == best_chunk_index:
-                return filename, str(payload.get("text", ""))
-        return filename, ""
-
-    if total_chunks <= FULL_DOCUMENT_CHUNK_THRESHOLD:
-        full_text = "\n".join(str((p.payload or {}).get("text", "")) for p in ordered if (p.payload or {}).get("text")).strip()
-        return filename, full_text
-
-    eff_radius = WINDOW_RADIUS * 3 if is_single_doc else WINDOW_RADIUS
-    start_idx = best_chunk_index - eff_radius
-    end_idx = best_chunk_index + eff_radius
-
-    if start_idx < 0:
-        end_idx += (0 - start_idx)
-        start_idx = 0
-    if end_idx >= total_chunks:
-        start_idx -= (end_idx - (total_chunks - 1))
-        end_idx = total_chunks - 1
-    if start_idx < 0:
-        start_idx = 0
-
-    selected = [p for p in ordered if start_idx <= int((p.payload or {}).get("chunk_index", 0)) <= end_idx]
-    partial_text = "\n".join(str((p.payload or {}).get("text", "")) for p in selected if (p.payload or {}).get("text")).strip()
-    header = _build_partial_header(filename, best_chunk_index, start_idx, end_idx, total_chunks)
-
-    return filename, header + partial_text
+    # Always return only the best matching chunk (no surrounding context window)
+    for p in ordered:
+        payload = p.payload or {}
+        if int(payload.get("chunk_index", 0)) == best_chunk_index:
+            return filename, str(payload.get("text", ""))
+    return filename, ""
 
 
 def _payload_to_chunk_dict(payload: Dict[str, Any], score: float = 0.0) -> Dict[str, Any]:

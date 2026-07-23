@@ -49,6 +49,11 @@ try:
 except ImportError:
     yaml = None
 
+try:
+    from striprtf.striprtf import rtf_to_text
+except ImportError:
+    rtf_to_text = None
+
 
 # ─── Chargement du .env à la racine du projet ───────────────────────────────
 _ROOT_ENV = Path(__file__).resolve().parent
@@ -1145,12 +1150,14 @@ def chunk_by_type(filepath: Path, text: str, base_document_id: str) -> list[dict
         if ext in (".yaml", ".yml"):
             structured = chunk_yaml_structured(text)
             return structured if structured else [{"text": chunk, "doctype": "generic", "chunk_index": i} for i, chunk in enumerate(split_text_uniformly(text))]
-        if ext in (".html", ".htm", ".xhtml"):
+        if ext in (".html", ".htm", ".xhtml", ".xml"):
             structured = chunk_html_glossary(text)
             return structured if structured else [{"text": chunk, "doctype": "generic", "chunk_index": i} for i, chunk in enumerate(split_text_uniformly(text))]
         if ext == ".pdf":
             return chunk_pdf_by_sections(text)
         if ext in (".txt", ".md", ".markdown", ".rst", ".adoc"):
+            return chunk_text_structured(text)
+        if ext == ".rtf":
             return chunk_text_structured(text)
     except Exception as e:
         print(f"[!] Structured chunking failed for {filepath.name}: {e}. Falling back to uniform chunking.")
@@ -1162,6 +1169,16 @@ def read_pdf_document(filepath: Path) -> tuple[str, str]:
     print(f"[~] Converting PDF to Markdown via pymupdf4llm: {filepath.name}")
     md_text = pymupdf4llm.to_markdown(str(filepath))
     return md_text, "pdf-to-markdown"
+
+
+def read_rtf_document(filepath: Path) -> tuple[str, str]:
+    print(f"[~] Converting RTF to text: {filepath.name}")
+    raw = filepath.read_bytes()
+    encoding = detect_bom_encoding(raw)
+    text = raw.decode(encoding or "utf-8", errors="ignore")
+    if rtf_to_text is not None:
+        text = rtf_to_text(text)
+    return text, "rtf-to-text"
 
 
 # ─── Optimisation du contenu ─────────────────────────────────────────────────
@@ -1771,6 +1788,8 @@ def index_documents():
 
             if ext == ".pdf":
                 text, encodingused = read_pdf_document(filepath)
+            elif ext == ".rtf":
+                text, encodingused = read_rtf_document(filepath)
             else:
                 text, encodingused = read_text_document(filepath)
 
@@ -1803,19 +1822,7 @@ def index_documents():
             total_chunks += len(chunks)
             print(f"[~] Chunked {filepath.name} into {len(chunks)} structured chunks (Tags: {tags})")
 
-            # ── Génération du résumé (une fois par document, si non déjà indexé) ──
-            chunk0_id = generate_chunk_stable_id(document_id, 0)
-            if not is_fresh and chunk0_id in existing_ids:
-                print(f"[~] Document already indexed, skipping summary: {filepath.name}")
-                doc_summary = None
-            else:
-                print(f"[~] Generating summary for '{filepath.name}'...")
-                doc_summary = generate_doc_summary(filepath.name, optimized_text)
-                if doc_summary:
-                    print(f"[✓] Summary generated ({len(doc_summary)} chars)")
-                else:
-                    print(f"[!] No summary generated for '{filepath.name}'")
-            # ─────────────────────────────────────────────────────────────────────
+            doc_summary = None
 
             for chunk_index, chunk_meta in enumerate(chunks):
                 chunk_text = chunk_meta.get("text", "").strip()
@@ -1847,10 +1854,8 @@ def index_documents():
                     "parent_key": chunk_meta.get("parent_key", "") or "",
                 }
 
-                # Chunk 0 : résumé + base64
+                # Chunk 0 : base64
                 if chunk_index == 0:
-                    if doc_summary:
-                        payload_extra["doc_summary"] = doc_summary
                     if file_base64:
                         payload_extra["file_base64"] = file_base64
 
