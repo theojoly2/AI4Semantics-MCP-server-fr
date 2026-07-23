@@ -150,28 +150,15 @@ def parallel_rerank(pairs, batch_size: int | None = None):
 # FONCTIONS CŒUR DE RECHERCHE
 # =====================================================================
 
-def _build_query_filter(tags: list = None, document_filter: str = None):
-    must_conditions = []
+def _build_query_filter(tags: list = None):
     if tags:
-        must_conditions.append(FieldCondition(key="tags", match=MatchAny(any=tags)))
-    if document_filter:
-        # Match sur document_name exact, ou substring sur filename
-        must_conditions.append(
-            Filter(should=[
-                FieldCondition(key="document_name", match=MatchValue(value=document_filter)),
-                FieldCondition(key="filename", match=MatchValue(value=document_filter)),
-            ])
-        )
-    if must_conditions:
-        if len(must_conditions) == 1:
-            return Filter(must=must_conditions)
-        return Filter(must=must_conditions)
+        return Filter(must=[FieldCondition(key="tags", match=MatchAny(any=tags))])
     return None
 
 
-def _run_chunk_search(search_terms: str, raw_limit: int, tags: list = None, document_filter: str = None):
+def _run_chunk_search(search_terms: str, raw_limit: int, tags: list = None):
     query_vectors = _cached_encode(search_terms)
-    query_filter = _build_query_filter(tags=tags, document_filter=document_filter)
+    query_filter = _build_query_filter(tags=tags)
 
     dense_res, sparse_res = None, None
     if "dense" in query_vectors:
@@ -324,7 +311,6 @@ def retrieve_search_documents(
     search_terms: str,
     tags: list = None,
     limit: int = None,
-    document_filter: str = None,
 ) -> List[Tuple[str, str, str, Any, float, list, str, int]]:
     #                                                  ^^^^ document_id  ^^^^ best_chunk_index
     if limit is None:
@@ -343,7 +329,7 @@ def retrieve_search_documents(
         t_start = time.time()
         raw_limit = max(800, RERANK_POOL_SIZE * 15, limit * 20)
 
-        results = _run_chunk_search(search_terms, raw_limit, tags=tags, document_filter=document_filter)
+        results = _run_chunk_search(search_terms, raw_limit, tags=tags)
         points = getattr(results, "points", [])
 
         if not points:

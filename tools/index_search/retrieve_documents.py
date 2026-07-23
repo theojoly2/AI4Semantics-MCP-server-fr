@@ -119,7 +119,6 @@ def retrieve_documents(
     limit: int = 10,
     return_full_document: bool = True,
     tags: list = None,
-    document_filter: str = None,
 ) -> List[Dict[str, Any]]:
     """
     Recherche des documents et retourne une liste de chunks enrichis
@@ -133,7 +132,6 @@ def retrieve_documents(
             search_terms=search_terms,
             tags=tags,
             limit=limit,
-            document_filter=document_filter,
         )
 
         if not search_results:

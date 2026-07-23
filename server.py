@@ -39,7 +39,6 @@ async def async_retrieve_documents(
     limit: int = 10,
     return_full_document: bool = True,
     tags: Optional[List[str]] = None,
-    document_filter: Optional[str] = None,
 ) -> list:
     """
     Recherche des documents ou standards dans la base de connaissances.
@@ -53,7 +52,6 @@ async def async_retrieve_documents(
         limit=limit,
         return_full_document=return_full_document,
         tags=tags,
-        document_filter=document_filter,
     )
 
     # Exécution dans le thread pool
