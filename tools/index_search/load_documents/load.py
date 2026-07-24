@@ -983,10 +983,167 @@ def chunk_yaml_structured(text: str) -> list[dict[str, Any]]:
     return chunk_json_structured(json.dumps(data, ensure_ascii=False))
 
 
+def _html_text(elem) -> str:
+    """Extract clean text from a BeautifulSoup element."""
+    return elem.get_text(" ", strip=True)
+
+
+def chunk_eurlex_html(soup) -> list[dict[str, Any]]:
+    """
+    Détecte et découpe un document HTML Eur-Lex / Journal officiel de l'UE
+    par chapitres et articles, en utilisant les classes CSS officielles.
+    Les gros blocs (préambule, articles longs) sont subdivisés.
+    """
+    chunks = []
+    current_chapter = ""
+    current_section = ""
+    current_article = ""
+    current_body: list[str] = []
+    idx = 0
+
+    def _emit(body_parts: list[str], extra_title: str = "", article_override: str = "") -> None:
+        nonlocal idx
+        if not body_parts:
+            return
+        body = "\n".join(body_parts).strip()
+        if not body:
+            return
+        title_parts = [p for p in [current_chapter, current_section, current_article, extra_title] if p]
+        title = " — ".join(title_parts)
+        text_chunk = f"{title}\n\n{body}".strip() if title else body
+        chunks.append({
+            "text": text_chunk,
+            "doctype": "eurlex_article",
+            "section_title": title,
+            "article": article_override or current_article,
+            "chunk_index": idx,
+        })
+        idx += 1
+
+    def flush(subdivide: bool = True) -> None:
+        nonlocal current_body
+        if not current_body:
+            current_body = []
+            return
+        title_parts = [p for p in [current_chapter, current_section, current_article] if p]
+        title = " — ".join(title_parts)
+        full_text = "\n".join(current_body).strip()
+        current_body = []
+
+        if not subdivide or len(full_text) <= CHUNK_SIZE:
+            _emit([full_text])
+            return
+
+        # Subdivide large blocks while keeping the article/chapter context in each piece
+        sub_chunks = split_text_uniformly(full_text, CHUNK_SIZE, CHUNK_OVERLAP)
+        for sub in sub_chunks:
+            _emit([sub])
+
+    def flush_preamble(preamble_body: list[str]) -> None:
+        nonlocal idx
+        if not preamble_body:
+            return
+        body = "\n".join(preamble_body).strip()
+        if not body:
+            return
+        if len(body) <= CHUNK_SIZE:
+            _emit([body], extra_title="Préambule")
+            return
+        sub_chunks = split_text_uniformly(body, CHUNK_SIZE, CHUNK_OVERLAP)
+        for sub in sub_chunks:
+            _emit([sub], extra_title="Préambule")
+
+    # Find the main content container; fallback to body
+    main = soup.find("main") or soup.find("div", class_="eli-container") or soup.body or soup
+    if main is None:
+        return []
+
+    preamble_body: list[str] = []
+    in_preamble = True
+    doc_title_parts: list[str] = []
+
+    for elem in main.find_all(["p", "div"]):
+        classes = elem.get("class", []) or []
+        txt = _html_text(elem)
+        if not txt:
+            continue
+
+        # Document main title (before preamble): collect consecutive oj-doc-ti lines
+        if "oj-doc-ti" in classes:
+            if not doc_title_parts:
+                flush_preamble(preamble_body)
+                preamble_body = []
+                current_article = ""
+                current_section = ""
+                current_chapter = ""
+                in_preamble = False
+            doc_title_parts.append(txt)
+            continue
+
+        # Flush collected title once we hit the real preamble text or structure
+        if doc_title_parts:
+            _emit(["\n".join(doc_title_parts)], extra_title="Titre")
+            doc_title_parts = []
+
+        # We are still in preamble before any chapter/article
+        if in_preamble and "oj-ti-section-1" not in classes and "oj-ti-section-2" not in classes and "oj-ti-art" not in classes:
+            preamble_body.append(txt)
+            continue
+
+        # Chapter heading
+        if "oj-ti-section-1" in classes:
+            flush_preamble(preamble_body)
+            preamble_body = []
+            in_preamble = False
+            flush()
+            current_chapter = txt
+            current_section = ""
+            current_article = ""
+            continue
+
+        # Section heading
+        if "oj-ti-section-2" in classes:
+            flush()
+            current_section = txt
+            current_article = ""
+            continue
+
+        # Article heading
+        if "oj-ti-art" in classes:
+            flush()
+            current_article = txt
+            continue
+
+        # Ordinary paragraph
+        if in_preamble:
+            preamble_body.append(txt)
+        else:
+            current_body.append(txt)
+
+    if doc_title_parts:
+        _emit(["\n".join(doc_title_parts)], extra_title="Titre")
+    flush_preamble(preamble_body)
+    flush()
+    return chunks
+
+
+def _clean_html_to_text(text: str) -> str:
+    """Strip HTML tags and scripts, keeping paragraph structure."""
+    if BeautifulSoup is None:
+        return text
+    soup = BeautifulSoup(text, "html.parser")
+    for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
+        tag.decompose()
+    # Replace block elements with newlines to preserve some structure
+    for tag in soup.find_all(["p", "div", "li", "br", "h1", "h2", "h3", "h4", "h5", "h6"]):
+        tag.append("\n")
+    return soup.get_text("\n", strip=True)
+
+
 def chunk_html_glossary(text: str) -> list[dict[str, Any]]:
     """
     Extrait un glossaire web structuré : liste de termes/définitions.
-    Fallback : chunk par titres.
+    Fallback : documents Eur-Lex, puis chunk par titres, puis texte structuré.
     """
     if BeautifulSoup is None:
         return []
@@ -1002,9 +1159,9 @@ def chunk_html_glossary(text: str) -> list[dict[str, Any]]:
     dts = soup.find_all("dt")
     if dts:
         for idx, dt in enumerate(dts):
-            term = dt.get_text(" ", strip=True)
+            term = _html_text(dt)
             dd = dt.find_next("dd")
-            definition = dd.get_text(" ", strip=True) if dd else ""
+            definition = _html_text(dd) if dd else ""
             body = f"Terme : {term}\nDéfinition : {definition}".strip()
             chunks.append({
                 "text": body,
@@ -1015,7 +1172,12 @@ def chunk_html_glossary(text: str) -> list[dict[str, Any]]:
             })
         return chunks
 
-    # Stratégie 2 : titres h2/h3 suivis de paragraphes
+    # Stratégie 2 : documents Eur-Lex / Journal officiel de l'UE
+    eurlex_chunks = chunk_eurlex_html(soup)
+    if eurlex_chunks:
+        return eurlex_chunks
+
+    # Stratégie 3 : titres h2/h3 suivis de paragraphes
     sections = []
     current_title = ""
     current_body = []
@@ -1024,26 +1186,30 @@ def chunk_html_glossary(text: str) -> list[dict[str, Any]]:
         if elem.name in ("h1", "h2", "h3", "h4"):
             if current_body:
                 sections.append((current_title, "\n".join(current_body)))
-            current_title = elem.get_text(" ", strip=True)
+            current_title = _html_text(elem)
             current_body = []
         else:
-            txt = elem.get_text(" ", strip=True)
+            txt = _html_text(elem)
             if txt:
                 current_body.append(txt)
     if current_body:
         sections.append((current_title, "\n".join(current_body)))
 
-    for idx, (title, body) in enumerate(sections):
-        text_chunk = f"{title}\n\n{body}".strip() if title else body
-        if text_chunk:
-            chunks.append({
-                "text": text_chunk,
-                "doctype": "html_section",
-                "section_title": title,
-                "chunk_index": idx,
-            })
+    if sections:
+        for idx, (title, body) in enumerate(sections):
+            text_chunk = f"{title}\n\n{body}".strip() if title else body
+            if text_chunk:
+                chunks.append({
+                    "text": text_chunk,
+                    "doctype": "html_section",
+                    "section_title": title,
+                    "chunk_index": idx,
+                })
+        return chunks
 
-    return chunks
+    # Stratégie 4 : fallback texte structuré sur HTML nettoyé
+    clean_text = _clean_html_to_text(str(soup))
+    return chunk_text_structured(clean_text)
 
 
 def chunk_pdf_by_sections(text: str) -> list[dict[str, Any]]:
